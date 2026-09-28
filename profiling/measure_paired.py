@@ -27,7 +27,8 @@ import sys
 import tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RAW = os.path.join(REPO, "profiling", "devbench", "raw50.pkl")
+# FSRS_PAIRED_RAW selects another cache (e.g. raw1000.pkl for the 1000-user validation).
+RAW = os.path.join(REPO, "profiling", "devbench", os.environ.get("FSRS_PAIRED_RAW", "raw50.pkl"))
 N_SLOTS, REPS, FIRST_CPU = 5, 3, 4
 
 
@@ -135,7 +136,8 @@ def main():
                "mean_logloss_a": st.mean(r["ll_a"] for r in res.values()),
                "mean_logloss_b": st.mean(r["ll_b"] for r in res.values())}
     # Correctness bar (CLAUDE.md 3b): mean LogLoss in 0.3098 +- 0.0015, anchored to iter 0.
-    summary["logloss_in_band"] = 0.3083 <= summary["mean_logloss_b"] <= 0.3113
+    # (The band is defined on the 50-user set only; other user sets report None.)
+    summary["logloss_in_band"] = (0.3083 <= summary["mean_logloss_b"] <= 0.3113) if len(res) == 50 else None
     print(json.dumps(summary))
     if out:
         json.dump({"summary": summary, "per_user": res}, open(out, "w"))
