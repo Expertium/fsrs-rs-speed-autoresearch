@@ -110,7 +110,7 @@ fn ln8<const FAST: bool>(x: f32x8) -> f32x8 {
 // Finished FSRS-7 34-param layout. NOTE: the field names ln_w27/ln_w28/aa16 are LEGACY labels
 // kept to limit churn — they now hold ln(base1=w[25]), ln(base2=w[26]), exp(short sinc_base
 // w[15]-1.5) respectively.
-struct WConsts {
+pub(crate) struct WConsts {
     ln_w27: f32, // ln(w[25]) = ln(base1)   (curve_fwd: q1 = ln_base1/decay1)
     ln_w28: f32, // ln(w[26]) = ln(base2)   (curve_fwd: p28 = (inv2*ln_base2).exp())
     aa7: f32,    // exp(w[7]-1.5)   (long stab sinc_base, start=7)
@@ -128,7 +128,7 @@ struct WConsts {
     nid2: f32x8,    // -1 / decay2^2
 }
 
-fn wconsts(w: &[f32]) -> WConsts {
+pub(crate) fn wconsts(w: &[f32]) -> WConsts {
     let k = f32x8::splat;
     let m2 = k(w[24]);
     let decay2 = k(0.0) - clamp8(m2, 0.01, 0.95);
@@ -1023,7 +1023,7 @@ pub(crate) fn batch_loss_simd(
 // Per-timestep cache for the vectorized backward. The first review (t==0) only needs the init
 // override's data (the curve/stab/next_d it computes are dead, overridden), so it gets a small
 // `First` variant; every later step stores the full forward intermediates (`Full`).
-enum Step8 {
+pub(crate) enum Step8 {
     First {
         rc: f32x8,
         init_s: f32x8,
@@ -1303,96 +1303,100 @@ pub(crate) fn batch_loss_and_grad_simd(
 // up to FP reassociation — judged by the 3b average-log-loss band (build_host_batches groups the SAME
 // cards-as-units as the Phase-1 probe, so the trained params match it modulo FP).
 
+/// d/dr of -wt*BCE via the unified label identity: d[-ln(1-|label-r|)]/dr = -sign(label-r)/
+/// (1-|label-r|). ONE division (label is 0/1); padding/filtered steps have wt==0 -> 0; the
+/// [MIN_R,MAX_R] clamp zeroes the adjoint outside the range. (3b trade vs lbl/r - (1-lbl)/(1-r).)
+/// A fn, not a closure: LLVM did not inline the closure (a real call per step).
+#[inline(always)]
+fn g_r_loss_at(r_raw: f32x8, weights: &[f32], labels: &[f32], base: usize) -> f32x8 {
+    let k = f32x8::splat;
+    let (one, z) = (k(1.0), k(0.0));
+    let wt = load8(weights, base);
+    let lbl = load8(labels, base);
+    let r = clamp8(r_raw, MIN_R, MAX_R);
+    let dd = lbl - r;
+    let sgn = dd.cmp_gt(z).blend(one, z - one);
+    let g_r = (z - wt) * (sgn / (one - dd.fast_max(z - dd)));
+    (r_raw.cmp_gt(k(MIN_R)) & r_raw.cmp_lt(k(MAX_R))).blend(g_r, z)
+}
+
 /// Windowed forward + reverse-mode backward for one card-grouped batch. Accumulates d(loss)/d(w) into
 /// `gw` (length 36); the loss VALUE is unused by training (only the gradient drives Adam), so the f64
 /// per-lane BCE is skipped here and 0.0 is returned — validation uses `card_loss_simd`. Batch padded
-/// to a multiple of 8.
+/// to a multiple of 8. Training splits the groups over two threads via `card_group_grad` instead.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn card_loss_and_grad_simd(
     w: &[f32], t_hist: &[f32], r_hist: &[f32], seq_len: usize, batch: usize,
     labels: &[f32], weights: &[f32], gw: &mut [f64],
 ) -> f64 {
     debug_assert!(batch % 8 == 0, "card_loss_and_grad_simd needs batch padded to a multiple of 8");
-    debug_assert!(seq_len >= 2, "windowed grad needs seq_len >= 2 (min surviving prefix length is 2)");
     let wc = wconsts(w);
-    let k = f32x8::splat;
-    let z = k(0.0);
-    let n_groups = batch / 8;
-    // d/dr of -wt*BCE via the unified label identity: d[-ln(1-|label-r|)]/dr = -sign(label-r)/
-    // (1-|label-r|). ONE division (label is 0/1); padding/filtered steps have wt==0 -> 0; the
-    // [MIN_R,MAX_R] clamp zeroes the adjoint outside the range. (3b trade vs lbl/r - (1-lbl)/(1-r).)
-    // Shared by the peeled last step and the reverse loop below. A fn, not a closure: LLVM did not
-    // inline the closure (a real call per step).
-    #[inline(always)]
-    fn g_r_loss_at(r_raw: f32x8, weights: &[f32], labels: &[f32], base: usize) -> f32x8 {
-        let k = f32x8::splat;
-        let (one, z) = (k(1.0), k(0.0));
-        let wt = load8(weights, base);
-        let lbl = load8(labels, base);
-        let r = clamp8(r_raw, MIN_R, MAX_R);
-        let dd = lbl - r;
-        let sgn = dd.cmp_gt(z).blend(one, z - one);
-        let g_r = (z - wt) * (sgn / (one - dd.fast_max(z - dd)));
-        (r_raw.cmp_gt(k(MIN_R)) & r_raw.cmp_lt(k(MAX_R))).blend(g_r, z)
-    }
     let mut caches: Vec<Step8> = Vec::with_capacity(seq_len);
-    for g in 0..n_groups {
-        let c0 = g * 8;
-        caches.clear();
-        // This group's own length: trailing timesteps where all 8 lanes are padding (rating 0; real
-        // ratings are >= 1) carry weight 0 and only pass the state through, so they add exactly 0
-        // to the gradient — skip them (bit-for-bit). Min 2 = the shortest card.
-        let mut seq_len = seq_len;
-        while seq_len > 2 && load8(r_hist, (seq_len - 1) * batch + c0).reduce_add() == 0.0 {
-            seq_len -= 1;
-        }
-        let (mut s, mut d, mut sf) = (z, z, z);
-        // Forward over every step EXCEPT the last (full step + cache). The last step's stability/
-        // next-difficulty update feeds no t+1, so we compute its curve only (just below) — exactly
-        // like card_loss_simd's validation skip-last. The first review (t==0) is peeled off, so the
-        // loop body has no t==0 branch.
-        let (ns, cache) = step8_fwd::<false>(w, z, load8(r_hist, c0), (s, d, sf), true, &wc);
-        (s, d, sf) = ns;
-        caches.push(cache);
-        for t in 1..seq_len - 1 {
-            let base = t * batch + c0;
-            let (ns, cache) = step8_fwd::<false>(
-                w, load8(t_hist, base), load8(r_hist, base), (s, d, sf), false, &wc,
-            );
-            (s, d, sf) = ns;
-            caches.push(cache);
-        }
-        // Last step (t = seq_len-1, always >= 1): curve ONLY, from the clamped incoming state — the
-        // exact curve step8_fwd would compute. (debug_assert seq_len>=2 guards the 0..seq_len-1 above.)
-        let lbase = (seq_len - 1) * batch + c0;
-        let dt_last = load8(t_hist, lbase).fast_max(z);
-        let (ls, lsf, ld) =
-            (s, sf, d); // step8_fwd outputs are already clamped
-        let fc_last = curve8_fwd::<false>(
-            w, dt_last, ls, lsf, ld, &wc, ln8::<false>(ls), ln8::<false>(lsf),
-        );
-        // Reverse pass. The final state's adjoint is 0, so at the last step the stab/next_d backward
-        // all multiply 0 -> only curve8_bwd(loss-adjoint) contributes. BIT-FOR-BIT identical to a full
-        // step8_bwd with g_out=0. The clamp gate uses the UNCLAMPED incoming state (= s0/d0/sf0).
-        let mut gw_g = [f32x8::splat(0.0); 34];
-        let g_rraw_last = g_r_loss_at(fc_last.out, weights, labels, lbase);
-        let (g_ls, g_lsf, g_ld) = curve8_bwd(
-            w, &fc_last, dt_last, ls, lsf, ld, g_rraw_last, f32x8::splat(0.0), &mut gw_g, &wc,
-        );
-        let mut g_s = (s.cmp_gt(k(S_MIN)) & s.cmp_lt(k(S_MAX))).blend(g_ls, z);
-        let mut g_d = (d.cmp_gt(k(D_MIN)) & d.cmp_lt(k(D_MAX))).blend(g_ld, z);
-        let mut g_sf = (sf.cmp_gt(k(S_MIN)) & sf.cmp_lt(k(S_MAX))).blend(g_lsf, z);
-        for (t, cache) in caches.iter().enumerate().skip(1).rev() {
-            let g_r_loss = g_r_loss_at(cache.curve_out(), weights, labels, t * batch + c0);
-            (g_s, g_d, g_sf) = step8_bwd(w, cache, (g_s, g_d, g_sf), g_r_loss, &mut gw_g, &wc);
-        }
-        // init step (t==0): no prediction (min surviving prefix length is 2).
-        step8_bwd(w, &caches[0], (g_s, g_d, g_sf), z, &mut gw_g, &wc);
+    for g in 0..batch / 8 {
+        let gg = card_group_grad(w, &wc, t_hist, r_hist, seq_len, batch, labels, weights, g, &mut caches);
         for i in 0..34 {
-            gw[i] += gw_g[i].reduce_add() as f64;
+            gw[i] += gg[i] as f64;
         }
     }
     0.0
+}
+
+/// Windowed forward + backward of 8-card group `g` (columns 8g..8g+8) of a batch. Returns the
+/// group's per-parameter gradient (the lane sums, f32); callers add the groups to their f64 total
+/// IN GROUP ORDER, so any split of the groups over threads stays bit-for-bit.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn card_group_grad(
+    w: &[f32], wc: &WConsts, t_hist: &[f32], r_hist: &[f32], seq_len: usize, batch: usize,
+    labels: &[f32], weights: &[f32], g: usize, caches: &mut Vec<Step8>,
+) -> [f32; 34] {
+    debug_assert!(seq_len >= 2, "windowed grad needs seq_len >= 2 (min surviving prefix length is 2)");
+    let k = f32x8::splat;
+    let z = k(0.0);
+    let c0 = g * 8;
+    caches.clear();
+    // This group's own length: trailing timesteps where all 8 lanes are padding (rating 0; real
+    // ratings are >= 1) carry weight 0 and only pass the state through, so they add exactly 0
+    // to the gradient — skip them (bit-for-bit). Min 2 = the shortest card.
+    let mut seq_len = seq_len;
+    while seq_len > 2 && load8(r_hist, (seq_len - 1) * batch + c0).reduce_add() == 0.0 {
+        seq_len -= 1;
+    }
+    let (mut s, mut d, mut sf) = (z, z, z);
+    // Forward over every step EXCEPT the last (full step + cache). The last step's stability/
+    // next-difficulty update feeds no t+1, so we compute its curve only (just below) — exactly
+    // like card_loss_simd's validation skip-last. The first review (t==0) is peeled off, so the
+    // loop body has no t==0 branch.
+    let (ns, cache) = step8_fwd::<false>(w, z, load8(r_hist, c0), (s, d, sf), true, wc);
+    (s, d, sf) = ns;
+    caches.push(cache);
+    for t in 1..seq_len - 1 {
+        let base = t * batch + c0;
+        let (ns, cache) =
+            step8_fwd::<false>(w, load8(t_hist, base), load8(r_hist, base), (s, d, sf), false, wc);
+        (s, d, sf) = ns;
+        caches.push(cache);
+    }
+    // Last step (t = seq_len-1, always >= 1): curve ONLY, from the incoming state (step8_fwd
+    // outputs are already clamped) — the exact curve step8_fwd would compute.
+    let lbase = (seq_len - 1) * batch + c0;
+    let dt_last = load8(t_hist, lbase).fast_max(z);
+    let fc_last = curve8_fwd::<false>(w, dt_last, s, sf, d, wc, ln8::<false>(s), ln8::<false>(sf));
+    // Reverse pass. The final state's adjoint is 0, so at the last step the stab/next_d backward
+    // all multiply 0 -> only curve8_bwd(loss-adjoint) contributes. BIT-FOR-BIT identical to a full
+    // step8_bwd with g_out=0. The clamp gate uses the UNCLAMPED incoming state (= s0/d0/sf0).
+    let mut gw_g = [z; 34];
+    let g_rraw_last = g_r_loss_at(fc_last.out, weights, labels, lbase);
+    let (g_ls, g_lsf, g_ld) = curve8_bwd(w, &fc_last, dt_last, s, sf, d, g_rraw_last, z, &mut gw_g, wc);
+    let mut g_s = (s.cmp_gt(k(S_MIN)) & s.cmp_lt(k(S_MAX))).blend(g_ls, z);
+    let mut g_d = (d.cmp_gt(k(D_MIN)) & d.cmp_lt(k(D_MAX))).blend(g_ld, z);
+    let mut g_sf = (sf.cmp_gt(k(S_MIN)) & sf.cmp_lt(k(S_MAX))).blend(g_lsf, z);
+    for (t, cache) in caches.iter().enumerate().skip(1).rev() {
+        let g_r_loss = g_r_loss_at(cache.curve_out(), weights, labels, t * batch + c0);
+        (g_s, g_d, g_sf) = step8_bwd(w, cache, (g_s, g_d, g_sf), g_r_loss, &mut gw_g, wc);
+    }
+    // init step (t==0): no prediction (min surviving prefix length is 2).
+    step8_bwd(w, &caches[0], (g_s, g_d, g_sf), z, &mut gw_g, wc);
+    std::array::from_fn(|i| gw_g[i].reduce_add())
 }
 
 /// Windowed forward-only BCE loss (validation) — `card_loss_and_grad_simd`'s forward without the

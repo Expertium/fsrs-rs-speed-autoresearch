@@ -41,6 +41,7 @@ Accept metric: **median per-user speed_ratio ≥ 1.05** (constraint 12) AND **sp
 | 34 | 12 | 13 | 0.948 | 10603 | 10603 | 1.000 | 1.000 | ✓ | rejected | Run the SIMD kernels 4 cards per lane (f32x4) instead of 8 |
 | 35 | 12 | 12 | 1.046 | 10603 | 10622 | 1.002 | 1.004 | ✓ | rejected | Stack: inline loss-grad helper, one-check load8, cache iterator, drop proven-redundant exp clamps |
 | 36 | 12 | 11 | 1.071 | 10603 | 10616 | 1.001 | 1.003 | ✓ | accepted | iter35 stack plus: skip re-clamping already-clamped states, drop ln8's redundant exponent mask |
+| 37 | 13 | 10 | 1.086 | 10616 | 10775 | 1.015 | 1.038 | ✓ | accepted | Second thread shares each batch's card groups (dynamic claims), also frees the input items |
 
-**Cumulative speed_ratio (product of accepted): ×214.921** — upward-biased (winner's curse); anchor periodically vs iter-0 baseline.
+**Cumulative speed_ratio (product of accepted): ×233.361** — upward-biased (winner's curse); anchor periodically vs iter-0 baseline.
 

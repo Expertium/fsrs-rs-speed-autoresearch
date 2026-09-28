@@ -24,6 +24,7 @@ use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasherDefault;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 mod training_v7 {
@@ -1343,9 +1344,9 @@ pub fn compute_parameters(
     if let Some(lr) = std::env::var("FSRS_LR").ok().and_then(|s| s.trim().parse().ok()) {
         config.learning_rate = lr;
     }
-    // The windowed path frees the prefix-items (one heap block each, ~10% of a large user's time)
-    // on the second thread (constraint 2) while this one trains; joined before returning.
-    let mut dropper = None;
+    // The windowed path hands the prefix-items to train(), whose second thread frees them (one
+    // heap block each, ~10% of a large user's time) while this one trains.
+    let mut garbage = None;
     let (train_host, total_size) = match train_card_ids {
         Some(train_card_ids) => {
             let host = build_host_batches_carded(
@@ -1354,7 +1355,7 @@ pub fn compute_parameters(
                 config.batch_size,
                 config.max_seq_len,
             );
-            dropper = Some(std::thread::spawn(move || drop((train_set, train_card_ids))));
+            garbage = Some((train_set, train_card_ids));
             host
         }
         None => {
@@ -1377,14 +1378,11 @@ pub fn compute_parameters(
     let model = train::<Autodiff<B>>(
         train_host,
         total_size,
+        garbage,
         &initialized_parameters,
         &config,
         progress.clone().map(|p| ProgressCollector::new(p, 0)),
     );
-
-    if let Some(dropper) = dropper {
-        dropper.join().unwrap();
-    }
     let optimized_parameters = model
         .inspect_err(|_e| {
             finish_progress();
@@ -1489,6 +1487,7 @@ pub fn benchmark(
     let model = train::<Autodiff<B>>(
         build_host_batches(weighted_train_set, config.batch_size),
         total_size,
+        None,
         &initialized_parameters,
         &config,
         None,
@@ -1682,9 +1681,77 @@ fn build_host_batches(items: Vec<WeightedFSRSItem>, batch_size: usize) -> Vec<Ba
     items.chunks(batch_size).map(build_batch_host).collect()
 }
 
+/// State shared with train()'s second thread (constraint 2: at most 2 threads per user). For each
+/// windowed batch the main thread publishes the weights and the batch, then BOTH threads claim
+/// 8-card groups from `job` and store each group's gradient at its index in `out`; the main thread
+/// then adds the groups in group order, so the result is bit-for-bit the one-thread sum. Batches
+/// take tens of microseconds, so the threads spin (spin_loop) instead of sleeping.
+struct GradShared<'a> {
+    host: &'a [BatchHost],
+    /// (job sequence << 32) | next group to claim. The sequence in the same word keeps a thread
+    /// that is still in an old job from claiming a group of the new one. JOB_STOP ends the helper.
+    job: AtomicU64,
+    batch: AtomicUsize,
+    w: [AtomicU32; 34],
+    done: AtomicUsize,
+    out: Vec<[AtomicU32; 34]>,
+}
+
+const JOB_STOP: u64 = u64::MAX;
+
+impl GradShared<'_> {
+    /// Claim and compute groups of job `seq` until none is left (or the job changed).
+    fn work(&self, seq: u32, w: &[f32], wc: &crate::analytic::WConsts, caches: &mut Vec<crate::analytic::Step8>) {
+        let hb = &self.host[self.batch.load(Ordering::Relaxed)];
+        let n = hb.bsz / 8;
+        loop {
+            let v = self.job.load(Ordering::Acquire);
+            let k = (v & 0xffff_ffff) as usize;
+            if (v >> 32) as u32 != seq || k >= n {
+                return;
+            }
+            if self.job.compare_exchange_weak(v, v + 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
+                continue;
+            }
+            // Longest groups first (cards are length-sorted within a batch): better balance.
+            let g = n - 1 - k;
+            let gg = crate::analytic::card_group_grad(
+                w, wc, &hb.th, &hb.rh, hb.seq, hb.bsz, &hb.lbl, &hb.wts, g, caches,
+            );
+            for (o, x) in self.out[g].iter().zip(gg) {
+                o.store(x.to_bits(), Ordering::Relaxed);
+            }
+            self.done.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    /// The second thread: free the prefix-items, then help with every published job.
+    fn helper<G>(&self, garbage: G) {
+        drop(garbage);
+        let mut caches = Vec::new();
+        let mut seen = 0u32;
+        loop {
+            let v = self.job.load(Ordering::Acquire);
+            if v == JOB_STOP {
+                return;
+            }
+            let seq = (v >> 32) as u32;
+            if seq == seen {
+                std::hint::spin_loop();
+                continue;
+            }
+            seen = seq;
+            let w: [f32; 34] = std::array::from_fn(|i| f32::from_bits(self.w[i].load(Ordering::Relaxed)));
+            let wc = crate::analytic::wconsts(&w);
+            self.work(seq, &w, &wc, &mut caches);
+        }
+    }
+}
+
 fn train<B: AutodiffBackend>(
     train_host: Vec<BatchHost>,
     total_size: usize,
+    garbage: Option<(Vec<FSRSItem>, Vec<i64>)>,
     initial_parameters: &[f32],
     config: &TrainingConfig,
     progress: Option<ProgressCollector>,
@@ -1755,6 +1822,23 @@ fn train<B: AutodiffBackend>(
     // t_bwd = analytic gradient, t_opt = hand-rolled Adam + clip. (Per-step extract is gone — the
     // train batches are pre-extracted once into train_host, so that cost is now a one-time floor.)
     let (mut t_pen, mut t_bwd, mut t_opt) = (0.0f64, 0.0f64, 0.0f64);
+    let shared = GradShared {
+        host: &train_host,
+        job: AtomicU64::new(0),
+        batch: AtomicUsize::new(0),
+        w: std::array::from_fn(|_| AtomicU32::new(0)),
+        done: AtomicUsize::new(0),
+        out: (0..train_host.iter().map(|hb| hb.bsz / 8).max().unwrap_or(0))
+            .map(|_| std::array::from_fn(|_| AtomicU32::new(0)))
+            .collect(),
+    };
+    let two_threads = train_host.iter().any(|hb| hb.windowed);
+    let mut caches = Vec::new();
+    let mut seq = 0u32;
+    std::thread::scope(|scope| {
+    if two_threads {
+        scope.spawn(|| shared.helper(garbage));
+    }
     for epoch in 1..=config.num_epochs {
         // Replicate the dataloader's per-epoch shuffle (one shuffle of [0, n_batches) per epoch).
         let mut order: Vec<usize> = (0..n_train_batches).collect();
@@ -1789,10 +1873,26 @@ fn train<B: AutodiffBackend>(
             let _tb = std::time::Instant::now();
             let mut total_grad = [0.0f64; 34];
             if hb.windowed {
-                // O(N) expanding-window grad: one pass per card, a loss at every timestep.
-                crate::analytic::card_loss_and_grad_simd(
-                    &w_vec, &hb.th, &hb.rh, hb.seq, hb.bsz, &hb.lbl, &hb.wts, &mut total_grad,
-                );
+                // O(N) expanding-window grad: one pass per card, a loss at every timestep, with the
+                // groups split over the two threads (see GradShared).
+                for (a, &x) in shared.w.iter().zip(&w_vec) {
+                    a.store(x.to_bits(), Ordering::Relaxed);
+                }
+                shared.batch.store(bi, Ordering::Relaxed);
+                shared.done.store(0, Ordering::Relaxed);
+                seq += 1;
+                shared.job.store((seq as u64) << 32, Ordering::Release);
+                let wc = crate::analytic::wconsts(&w_vec);
+                shared.work(seq, &w_vec, &wc, &mut caches);
+                let n = hb.bsz / 8;
+                while shared.done.load(Ordering::Acquire) < n {
+                    std::hint::spin_loop();
+                }
+                for group in &shared.out[..n] {
+                    for (t, o) in total_grad.iter_mut().zip(group) {
+                        *t += f32::from_bits(o.load(Ordering::Relaxed)) as f64;
+                    }
+                }
             } else {
                 crate::analytic::batch_loss_and_grad_simd(
                     &w_vec, &hb.th, &hb.rh, hb.seq, hb.bsz, &hb.dts, &hb.lbl, &hb.wts, &mut total_grad,
@@ -1874,6 +1974,8 @@ fn train<B: AutodiffBackend>(
 
         info!("epoch: {:?} done", epoch);
     }
+    shared.job.store(JOB_STOP, Ordering::Release);
+    });
     // Per-region training timing, silent unless FSRS_PROFILE is set (it printed on
     // every train() call before — clutter + stderr I/O in the timed path). The env
     // gate keeps the t_* accumulators live (no dead-code warnings) and lets profiling
