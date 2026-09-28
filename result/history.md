@@ -48,6 +48,7 @@ Accept metric: **median per-user speed_ratio ≥ 1.05** (constraint 12) AND **sp
 | 41 | 10 | 9 | 1.053 | 10907 | 10916 | 1.001 | 1.002 | ✓ | accepted | Backward: share product adjoints, merge divisions, apply weight-only factors once per group |
 | 42 | 9 | 8 | 1.097 | 10916 | 10972 | 1.005 | 1.013 | ✓ | accepted | Skip post-lapse branch on lapse-free steps; windowed path drops padding passthrough; share products |
 | 43 | 8 | 7 | 1.053 | 10972 | 11066 | 1.009 | 1.022 | ✓ | accepted | Base-2 exp/log in the recurrence; lapse-only terms skipped; signed weights; no burn Model |
+| 44 | 7 | 7 | 0.998 | 11066 | 11072 | 1.000 | 1.001 | ✓ | rejected | Fold aa, w23, factor2 into their exponentials (fewer multiplies per step) |
 
 **Cumulative speed_ratio (product of accepted): ×317.994** — upward-biased (winner's curse); anchor periodically vs iter-0 baseline.
 
