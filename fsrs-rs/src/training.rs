@@ -64,12 +64,12 @@ pub(crate) fn l2_penalty_grad(
     total_size: usize,
     l2_weight: f64,
     params_stddev: &[f32],
-) -> Vec<f32> {
-    let mut grad = vec![0.0f32; w.len()];
+) -> [f32; 34] {
+    let mut grad = [0.0f32; 34];
     if total_size == 0 {
         return grad;
     }
-    let size = w.len().min(init_w.len()).min(params_stddev.len());
+    let size = w.len().min(init_w.len()).min(params_stddev.len()).min(34);
     let scale = l2_weight * batch_size as f64 / total_size as f64;
     for i in 0..size {
         let sigma = params_stddev[i] as f64;
@@ -601,7 +601,7 @@ const ADAM_BETA2: f32 = 0.98;
 const ADAM_EPS: f32 = 1e-8;
 
 type SchedulePenaltyFn = fn(&[f32], usize, bool) -> (f64, [f64; PENALTY_GRAD_LEN]);
-type L2PenaltyFn = fn(&[f32], &[f32], usize, usize, f64, &[f32]) -> Vec<f32>;
+type L2PenaltyFn = fn(&[f32], &[f32], usize, usize, f64, &[f32]) -> [f32; 34];
 
 fn schedule_penalty_fn() -> SchedulePenaltyFn {
     training_v7::maybe_schedule_penalty_value_and_grad
@@ -997,7 +997,12 @@ fn recency_weight_tuned() -> impl Fn(usize, f32) -> f32 {
     let tuned = (c0_env.is_some() || exp_env.is_some())
         .then(|| (c0_env.unwrap_or(0.0667), exp_env.unwrap_or(11.25)));
     move |idx, length| match tuned {
-        None => 0.0667 + 0.9333 * (idx as f32 / length).powf(11.25),
+        // For x <= 0.17 the powf term is < 2.1e-9, under half an f32 step of 0.0667, so the sum is
+        // exactly 0.0667 (checked for every f32 x in [0, 0.17]): skip the powf there.
+        None => match idx as f32 / length {
+            x if x <= 0.17 => 0.0667,
+            x => 0.0667 + 0.9333 * x.powf(11.25),
+        },
         Some((c0, exp)) => c0 + (1.0 - c0) * (idx as f32 / length).powf(exp),
     }
 }
@@ -1580,11 +1585,11 @@ struct CardedPlan {
     n_preds: usize,
 }
 
+/// 12 bytes, so the per-item updates of `new` stay in cache (the id is card_ids[longest]).
 struct PlanCard {
-    id: i64,
-    full_len: usize,
-    longest: usize,
-    n_preds: usize,
+    full_len: u32,
+    longest: u32,
+    n_preds: u32,
 }
 
 impl CardedPlan {
@@ -1601,14 +1606,14 @@ impl CardedPlan {
                 continue;
             }
             let ci = *card_index.entry(id).or_insert_with(|| {
-                cards.push(PlanCard { id, full_len: 0, longest: 0, n_preds: 0 });
+                cards.push(PlanCard { full_len: 0, longest: 0, n_preds: 0 });
                 cards.len() - 1
             });
             let card = &mut cards[ci];
             // >= keeps the LAST longest prefix (max_by_key's tie rule).
-            if len >= card.full_len {
-                card.full_len = len;
-                card.longest = idx;
+            if len as u32 >= card.full_len {
+                card.full_len = len as u32;
+                card.longest = idx as u32;
             }
             card.n_preds += 1;
             preds.push((ci as u32, len as u32 - 1, idx as u32));
@@ -1616,7 +1621,7 @@ impl CardedPlan {
         // Each card's predictions, contiguous and in input order (a counting sort).
         let mut start = vec![0usize; cards.len() + 1];
         for (ci, card) in cards.iter().enumerate() {
-            start[ci + 1] = start[ci] + card.n_preds;
+            start[ci + 1] = start[ci] + card.n_preds as usize;
         }
         let mut fill = start.clone();
         let mut by_card = vec![(0u32, 0u32); preds.len()];
@@ -1624,16 +1629,21 @@ impl CardedPlan {
             by_card[fill[ci as usize]] = (t, idx);
             fill[ci as usize] += 1;
         }
-        let mut order: Vec<usize> = (0..cards.len()).collect();
-        order.sort_unstable_by_key(|&ci| (cards[ci].full_len, cards[ci].id));
+        // Sort the keys themselves (no per-comparison lookups into `cards`).
+        let mut keys: Vec<(u32, i64, u32)> = (cards.iter().enumerate())
+            .map(|(ci, card)| (card.full_len, card_ids[card.longest as usize], ci as u32))
+            .collect();
+        keys.sort_unstable();
+        let order: Vec<usize> = keys.iter().map(|&(_, _, ci)| ci as usize).collect();
         let mut bounds = Vec::new();
         let (mut first, mut current_preds) = (0, 0);
         for (k, &ci) in order.iter().enumerate() {
-            if k > first && current_preds + cards[ci].n_preds > batch_size {
+            let n_preds = cards[ci].n_preds as usize;
+            if k > first && current_preds + n_preds > batch_size {
                 bounds.push((first, k));
                 (first, current_preds) = (k, 0);
             }
-            current_preds += cards[ci].n_preds;
+            current_preds += n_preds;
         }
         if first < order.len() {
             bounds.push((first, order.len()));
@@ -1651,14 +1661,14 @@ impl CardedPlan {
         let batch = &self.order[first..end];
         let length = (self.n_items as f32).max(1.0);
         let bsz = self.bsz(b);
-        let seq = batch.iter().map(|&ci| self.cards[ci].full_len).max().unwrap_or(0);
+        let seq = batch.iter().map(|&ci| self.cards[ci].full_len as usize).max().unwrap_or(0);
         let mut th = vec![0.0f32; seq * bsz];
         let mut rh = vec![0.0f32; seq * bsz];
         let mut lbl = vec![0.0f32; seq * bsz];
         let mut wts = vec![0.0f32; seq * bsz];
         let mut predictions = 0;
         for (c, &ci) in batch.iter().enumerate() {
-            let reviews = &items[self.cards[ci].longest].reviews;
+            let reviews = &items[self.cards[ci].longest as usize].reviews;
             for (t, r) in reviews.iter().enumerate() {
                 th[t * bsz + c] = r.delta_t.max(0.0);
                 rh[t * bsz + c] = r.rating as f32;
@@ -1668,7 +1678,7 @@ impl CardedPlan {
                 wts[t * bsz + c] = weight(idx as usize, length);
                 lbl[t * bsz + c] = if reviews[t].rating == 1 { 0.0 } else { 1.0 };
             }
-            predictions += self.cards[ci].n_preds;
+            predictions += self.cards[ci].n_preds as usize;
         }
         BatchHost {
             seq, bsz, real_batch_size: predictions, th, rh, dts: Vec::new(), lbl, wts, windowed: true,
@@ -1830,8 +1840,8 @@ fn train<B: AutodiffBackend>(
     // model.w.val(); the returned Model is rebuilt once from the final w_host at the very end.
     let mut w_host: Vec<f32> = clip_parameters(initial_parameters);
     let init_w_vec = w_host.clone();
-    let mut adam_m = [0.0f32; 34]; // Adam 1st moment (burn AdaptiveMomentumState.moment_1)
-    let mut adam_v = [0.0f32; 34]; // Adam 2nd moment (moment_2)
+    let mut adam_m = [0.0f32; 40]; // Adam 1st moment (burn AdaptiveMomentumState.moment_1), padded
+    let mut adam_v = [0.0f32; 40]; // Adam 2nd moment (moment_2), padded
     let mut adam_t = 0i32; // step count (AdaptiveMomentumState.time; becomes 1 on the first step)
     // TUNER Adam-beta overrides (hp_tune per-cell fine tune). Default to the shipped consts so
     // production (neither var set) is bit-for-bit; read once here, used in the per-step loop below.
@@ -1900,10 +1910,23 @@ fn train<B: AutodiffBackend>(
                 }
             };
             let real_batch_size = hb.real_batch_size;
+            let w_vec = &w_host;
+            let _tb = tick();
+            if hb.windowed {
+                // Publish the job first: the helper starts on its groups while this thread computes
+                // the penalty terms and the learning rate, which the kernel does not need.
+                for (a, &x) in shared.w.iter().zip(w_vec) {
+                    a.store(x.to_bits(), Ordering::Relaxed);
+                }
+                shared.batch.store(bi, Ordering::Relaxed);
+                shared.done.store(0, Ordering::Relaxed);
+                seq += 1;
+                shared.job.store((seq as u64) << 32, Ordering::Release);
+            }
+            t_bwd += secs(_tb);
             let lr = LrScheduler::step(&mut lr_scheduler);
             let progress = Progress::new(iteration, n_train_batches);
             let _tp = tick();
-            let w_vec = &w_host;
             let mut manual_grad = l2_penalty(
                 w_vec,
                 &init_w_vec,
@@ -1912,11 +1935,13 @@ fn train<B: AutodiffBackend>(
                 l2_weight,
                 &training_v7::PARAMS_STDDEV,
             );
-            let (_schedule_value, schedule_grad) =
-                schedule_penalty(w_vec, real_batch_size, config.enable_sched_penalties);
-            let inv_total = 1.0 / total_size as f64;
-            for i in 0..manual_grad.len().min(schedule_grad.len()) {
-                manual_grad[i] += (schedule_grad[i] * inv_total) as f32;
+            if config.enable_sched_penalties {
+                // (Off by default; then its gradient is all zeros and adding it is a no-op.)
+                let (_schedule_value, schedule_grad) = schedule_penalty(w_vec, real_batch_size, true);
+                let inv_total = 1.0 / total_size as f64;
+                for i in 0..manual_grad.len().min(schedule_grad.len()) {
+                    manual_grad[i] += (schedule_grad[i] * inv_total) as f32;
+                }
             }
             t_pen += secs(_tp);
             // Host batch data was pre-extracted once into train_host (no per-step copy now).
@@ -1927,13 +1952,6 @@ fn train<B: AutodiffBackend>(
             if hb.windowed {
                 // O(N) expanding-window grad: one pass per card, a loss at every timestep, with the
                 // groups split over the two threads (see GradShared).
-                for (a, &x) in shared.w.iter().zip(w_vec) {
-                    a.store(x.to_bits(), Ordering::Relaxed);
-                }
-                shared.batch.store(bi, Ordering::Relaxed);
-                shared.done.store(0, Ordering::Relaxed);
-                seq += 1;
-                shared.job.store((seq as u64) << 32, Ordering::Release);
                 let wc = crate::analytic::wconsts(w_vec);
                 shared.work(seq, w_vec, &wc, &mut caches);
                 let n = hb.bsz / 8;
@@ -1980,14 +1998,26 @@ fn train<B: AutodiffBackend>(
             let f1 = 1.0f32 - beta1;
             let f2 = 1.0f32 - beta2;
             let lr_f32 = lr as f32;
-            for i in 0..34 {
-                let g = total_grad_f32[i];
-                adam_m[i] = adam_m[i] * beta1 + g * f1;
-                adam_v[i] = adam_v[i] * beta2 + g.powf(2.0) * f2;
-                let m_hat = adam_m[i] / bc1;
-                let v_hat = adam_v[i] / bc2;
-                w_host[i] -= lr_f32 * (m_hat / (v_hat.sqrt() + ADAM_EPS));
+            // 8 parameters per f32x8 (34 padded to 40; the padding lanes stay 0). Every op is
+            // element-wise IEEE (sqrt included), so this is the scalar loop's exact result.
+            let k = wide::f32x8::splat;
+            let mut wp = [0.0f32; 40];
+            wp[..34].copy_from_slice(&w_host);
+            let mut gp = [0.0f32; 40];
+            gp[..34].copy_from_slice(&total_grad_f32);
+            for r in (0..40).step_by(8).map(|i| i..i + 8) {
+                let ld = |a: &[f32; 40]| wide::f32x8::from(<[f32; 8]>::try_from(&a[r.clone()]).unwrap());
+                let g = ld(&gp);
+                let m = ld(&adam_m) * k(beta1) + g * k(f1);
+                let v = ld(&adam_v) * k(beta2) + g * g * k(f2);
+                let m_hat = m / k(bc1);
+                let v_hat = v / k(bc2);
+                let w = ld(&wp) - k(lr_f32) * (m_hat / (v_hat.sqrt() + k(ADAM_EPS)));
+                adam_m[r.clone()].copy_from_slice(&m.to_array());
+                adam_v[r.clone()].copy_from_slice(&v.to_array());
+                wp[r].copy_from_slice(&w.to_array());
             }
+            w_host.copy_from_slice(&wp[..34]);
             // The same clamp burn applied via parameter_clipper (clip_parameters), now in place.
             clip_parameters_in_place(&mut w_host);
             t_opt += secs(_to);

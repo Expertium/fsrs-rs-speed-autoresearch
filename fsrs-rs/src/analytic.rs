@@ -126,6 +126,9 @@ pub(crate) struct WConsts {
     m2_live: f32x8, // clamp gate of m2 = w24 (all-ones lanes where 0.01 < w24 < 0.95)
     p28_w26: f32x8, // p28 / base2[w26]
     nid2: f32x8,    // -1 / decay2^2
+    ln_w28_w27: f32, // ln(base_weight2[w28] / base_weight1[w27]): the constant term of the mix logit
+    nrw27: f32,      // -1 / w27 = d(logit)/d(w27)
+    rw28: f32,       // 1 / w28 = d(logit)/d(w28)
 }
 
 pub(crate) fn wconsts(w: &[f32]) -> WConsts {
@@ -148,6 +151,9 @@ pub(crate) fn wconsts(w: &[f32]) -> WConsts {
         m2_live: m2.cmp_gt(k(0.01)) & m2.cmp_lt(k(0.95)),
         p28_w26: p28 / k(w[26]),
         nid2: k(0.0) - k(1.0) / (decay2 * decay2),
+        ln_w28_w27: (w[28] / w[27]).ln(),
+        nrw27: -1.0 / w[27],
+        rw28: 1.0 / w[28],
     }
 }
 
@@ -651,9 +657,8 @@ struct Curve8 {
     b2: f32x8,
     r2: f32x8,
     ex34: f32x8,
-    ret: f32x8,
-    p31: f32x8,
-    se: f32x8,
+    sig: f32x8,
+    oms: f32x8,
     ln_sf: f32x8,
     ln_b1: f32x8,
     ln_b2: f32x8,
@@ -691,19 +696,19 @@ fn curve8_fwd<const FAST: bool>(
     let b2 = bv * wc.factor2 * ex34 + k(1.0);
     let ln_b2 = ln8::<FAST>(b2);
     let r2 = exp8_in_range::<FAST>(wc.decay2 * ln_b2);
-    let p31 = exp8_in_range::<FAST>(k(-w[29]) * ln_sf);
-    let weight1 = sp(27) * p31;
-    // se = s_long^s_weight_power2[w30] · exp((d_weight[w31]-0.5)·(d−5)) = exp(w30·ln_s +
-    // (w31-0.5)·(d−5)): ONE exp instead of two (iter24 fusion, ~1-ULP 3b reassociation; curve8_bwd
-    // reads c.se directly). weight2 = base_weight2[w28] * se.
-    let se = exp8_in_range::<FAST>(sp(30) * ln_s + (d - k(5.0)) * (sp(31) - k(0.5)));
-    let weight2 = sp(28) * se;
-    let wsum = weight1 + weight2;
-    let num = weight1 * r1 + weight2 * r2;
-    let ret = num / wsum;
+    // ret = (weight1*r1 + weight2*r2) / (weight1 + weight2), weight1 = base_weight1[w27] *
+    // sf^-s_weight_power1[w29], weight2 = base_weight2[w28] * s^s_weight_power2[w30] *
+    // exp((d_weight[w31]-0.5)(d-5)). Written as r1*(1-sig) + r2*sig with sig = sigmoid(z) and
+    // z = ln(weight2/weight1): the same function with ONE exp instead of two (3b reassociation).
+    // |z| <= ln(100) + 1.1*ln(36500) + 2.5 + 0.9*ln(36500) < 29, inside exp8's range.
+    let z = k(wc.ln_w28_w27) + sp(30) * ln_s + (d - k(5.0)) * (sp(31) - k(0.5)) + sp(29) * ln_sf;
+    let ez = exp8_in_range::<FAST>(z);
+    let oms = k(1.0) / (ez + k(1.0)); // 1 - sig
+    let sig = ez * oms;
+    let ret = r1 * oms + r2 * sig;
     let out = ret * k(1.0 - 2e-5) + k(1e-5);
     Curve8 {
-        out, a, bv, r1, q1, e1, p35, b2, r2, ex34, ret, p31, se, ln_sf, ln_b1, ln_b2, ln_s,
+        out, a, bv, r1, q1, e1, p35, b2, r2, ex34, sig, oms, ln_sf, ln_b1, ln_b2, ln_s,
     }
 }
 
@@ -724,29 +729,21 @@ fn curve8_bwd(
     let decay1 = k(0.0) - clamp8(m1, 0.01, 0.95);
     let factor1 = c.e1 - k(1.0);
     let b1 = c.a * factor1 + k(1.0);
-    let weight1 = sp(27) * c.p31;
-    let weight2 = sp(28) * c.se;
-    let wsum = weight1 + weight2;
     let g_ret = g_out * k(1.0 - 2e-5);
-    let g_num = g_ret / wsum;
-    let g_wsum = (z - g_ret) * c.ret / wsum;
-    let g_weight1 = g_num * c.r1 + g_wsum;
-    let g_weight2 = g_num * c.r2 + g_wsum;
-    // r1 also feeds the short-trace stability update (reads r1, not mixed R) -> g_r1_extra.
-    let g_r1 = g_num * weight1 + g_r1_extra;
-    let g_r2 = g_num * weight2;
-    // weight2 = base_weight2[w28] * se ; se = exp(w30*ln_s + (w31-0.5)*(d-5))  (fused)
-    gw[28] += g_weight2 * c.se;
-    let g_se = g_weight2 * sp(28) * c.se; // adjoint-on-se times se (shared d(se)/d(.) factor)
-    let mut g_d = g_se * (sp(31) - k(0.5)); // d(se)/dd  = se*(d_weight-0.5)
-    gw[31] += g_se * (d - k(5.0)); // d(se)/d(d_weight) = se*(d-5) (offset deriv = 1)
-    let mut g_s = g_se * sp(30) / s; // d(se)/ds  = se*s_weight_power2/s
-    gw[30] += g_se * c.ln_s; // d(se)/d(s_weight_power2) = se*ln_s
-    // weight1 = base_weight1[w27] * p31 ; p31 = sf^(-s_weight_power1[w29])
-    gw[27] += g_weight1 * c.p31;
-    let g_p31 = g_weight1 * sp(27);
-    let mut g_sf = g_p31 * k(-w[29]) * (c.p31 / sf);
-    gw[29] += g_p31 * (z - c.p31 * c.ln_sf);
+    // ret = r1*(1-sig) + r2*sig. r1 also feeds the short-trace stability update (reads r1, not
+    // mixed R) -> g_r1_extra.
+    let g_r1 = g_ret * c.oms + g_r1_extra;
+    let g_r2 = g_ret * c.sig;
+    // sig = sigmoid(z), dsig/dz = sig*(1-sig); z = ln(w28/w27) + w30*ln_s + (w31-0.5)*(d-5) + w29*ln_sf
+    let g_z = g_ret * (c.r2 - c.r1) * (c.sig * c.oms);
+    gw[27] += g_z * k(wc.nrw27);
+    gw[28] += g_z * k(wc.rw28);
+    gw[29] += g_z * c.ln_sf;
+    gw[30] += g_z * c.ln_s;
+    gw[31] += g_z * (d - k(5.0));
+    let mut g_d = g_z * (sp(31) - k(0.5));
+    let mut g_s = g_z * sp(30) / s;
+    let mut g_sf = g_z * sp(29) / sf;
     // r2 = b2^decay2 ; iter-165: b2 = bv*factor2*ex34 + 1 (ex34 = D time-scale) and
     // decay2 = -clamp(w24) is no longer d-modulated.
     let g_b2 = g_r2 * wc.decay2 * (c.r2 / c.b2);
@@ -786,6 +783,15 @@ fn curve8_bwd(
     (g_s, g_sf, g_d)
 }
 
+/// hard_penalty (rating 2) or easy_bonus (rating 4), else 1. At most one of the two factors of
+/// `x * hard * easy` differs from 1 and a product with 1 is exact, so `x * hard_easy8` is the same
+/// value with one multiply less.
+#[inline(always)]
+fn hard_easy8(w: &[f32], rating: f32x8, start: usize) -> f32x8 {
+    let k = f32x8::splat;
+    rating.cmp_eq(k(2.0)).blend(k(w[start + 6]), rating.cmp_eq(k(4.0)).blend(k(w[start + 7]), k(1.0)))
+}
+
 // f32x8 stability-after-review forward + the intermediates its backward needs (analogue of StabCache).
 struct Stab8 {
     out: f32x8,
@@ -807,8 +813,7 @@ fn stab8_fwd<const FAST: bool>(
     let sp = |i: usize| f32x8::splat(w[i]);
     let k = f32x8::splat;
     let one = k(1.0);
-    let hard = rating.cmp_eq(k(2.0)).blend(sp(start + 6), one);
-    let easy = rating.cmp_eq(k(4.0)).blend(sp(start + 7), one);
+    let he = hard_easy8(w, rating, start);
     let ln_ls1 = ln8::<FAST>(last_s + one);
     let qbase = exp8_in_range::<FAST>(sp(start + 4) * ln_ls1); // (last_s+1)^fail_s_exp[start+4]
     // fail_d_exp DROPPED: post-lapse stability is D-independent, so the legacy `pr` cache field now
@@ -820,7 +825,7 @@ fn stab8_fwd<const FAST: bool>(
     let cc = exp8_in_range::<FAST>(k(-w[start + 1]) * ln_ls);
     let expr = exp8_in_range::<FAST>((one - r) * sp(start + 2));
     let aa8 = k(aa);
-    let sinc = aa8 * bb * cc * (expr - one) * hard * easy + one;
+    let sinc = aa8 * bb * cc * (expr - one) * he + one;
     let ls_sinc = last_s * sinc;
     let nss = pls.fast_max(ls_sinc);
     let out = rating.cmp_gt(one).blend(nss, pls);
@@ -840,8 +845,7 @@ fn stab8_bwd(
     let z = k(0.0);
     // aa / hard / easy / ln_ls are recomputed or passed in (not cached): the same values stab8_fwd used.
     let aa = k(aa);
-    let hard = rating.cmp_eq(k(2.0)).blend(sp(start + 6), one);
-    let easy = rating.cmp_eq(k(4.0)).blend(sp(start + 7), one);
+    let he = hard_easy8(w, rating, start);
     let pls = last_s.fast_min(c.nsf_fail);
     let ls_sinc = last_s * c.sinc;
     let bb = k(11.0) - last_d;
@@ -860,13 +864,17 @@ fn stab8_bwd(
     // sinc = aa*bb*cc*(expr-1)*hard*easy + 1
     let em1 = c.expr - one;
     let g_prod = g_sinc;
-    let prod = aa * bb * c.cc * em1 * hard * easy;
+    let base = aa * bb * c.cc * em1;
+    let prod = base * he;
     gw[start] += g_prod * prod; // aa = exp(w[start]-1.5); dprod/dw[start] = prod
-    let g_bb = g_prod * (aa * c.cc * em1 * hard * easy);
-    let g_cc = g_prod * (aa * bb * em1 * hard * easy);
-    let g_em1 = g_prod * (aa * bb * c.cc * hard * easy);
-    gw[start + 6] += rating.cmp_eq(k(2.0)).blend(g_prod * (aa * bb * c.cc * em1 * easy), z); // hard_penalty
-    gw[start + 7] += rating.cmp_eq(k(4.0)).blend(g_prod * (aa * bb * c.cc * em1 * hard), z); // easy_bonus
+    let g_bb = g_prod * (aa * c.cc * em1 * he);
+    let g_cc = g_prod * (aa * bb * em1 * he);
+    let g_em1 = g_prod * (aa * bb * c.cc * he);
+    // d(prod)/d(hard_penalty) on rating-2 lanes and d(prod)/d(easy_bonus) on rating-4 lanes are
+    // both `base` (the other factor is exactly 1 there).
+    let g_base = g_prod * base;
+    gw[start + 6] += rating.cmp_eq(k(2.0)).blend(g_base, z); // hard_penalty
+    gw[start + 7] += rating.cmp_eq(k(4.0)).blend(g_base, z); // easy_bonus
     let g_last_d = g_bb * (z - one); // bb = 11 - last_d (the ONLY D-dependence of stab now)
     g_last_s += g_cc * k(-w[start + 1]) * (c.cc / last_s);
     gw[start + 1] += g_cc * (z - c.cc * ln_ls);
@@ -1086,7 +1094,7 @@ fn step8_fwd<const FAST: bool>(
         // The incoming state is a previous step8_fwd output, which is already clamped (the first
         // step clamps its init values too), so clamping it again would change nothing.
         let (last_s, last_d, last_sf) = (s0, d0, sf0);
-        let dt = dt_raw.fast_max(k(0.0));
+        let dt = dt_raw; // curve8_fwd/bwd clamp it at 0 themselves
         let ln_last_s = ln8::<FAST>(last_s);
         let ln_last_sf = ln8::<FAST>(last_sf);
         let curve = curve8_fwd::<FAST>(w, dt, last_s, last_sf, last_d, wc, ln_last_s, ln_last_sf);
@@ -1189,10 +1197,11 @@ fn step8_bwd(
             let g_last_s = g_ls_a + g_ls_d + g_last_s_extra;
             let g_last_sf = g_lsf_b + g_lsf_d + g_last_sf_extra;
             let g_last_d = g_ld_a + g_ld_b + g_ld_c + g_ld_d + g_last_d_extra;
-            let g_s0 = (s0.cmp_gt(k(S_MIN)) & s0.cmp_lt(k(S_MAX))).blend(g_last_s, z);
-            let g_d0 = (d0.cmp_gt(k(D_MIN)) & d0.cmp_lt(k(D_MAX))).blend(g_last_d, z);
-            let g_sf0 = (sf0.cmp_gt(k(S_MIN)) & sf0.cmp_lt(k(S_MAX))).blend(g_last_sf, z);
-            (g_s0, g_d0, g_sf0)
+            // No clamp gate here: s0/d0/sf0 are the previous step's clamped outputs, and that step's
+            // backward applies the same mask to this adjoint (S_MIN < x < S_MAX holds for the
+            // clamped value exactly when it holds for the unclamped one; a padding passthrough
+            // carries a zero adjoint), so gating here too would change nothing.
+            (g_last_s, g_last_d, g_last_sf)
         }
     }
 }
@@ -1379,17 +1388,16 @@ pub(crate) fn card_group_grad(
     // Last step (t = seq_len-1, always >= 1): curve ONLY, from the incoming state (step8_fwd
     // outputs are already clamped) — the exact curve step8_fwd would compute.
     let lbase = (seq_len - 1) * batch + c0;
-    let dt_last = load8(t_hist, lbase).fast_max(z);
+    let dt_last = load8(t_hist, lbase); // curve8_fwd/bwd clamp it at 0 themselves
     let fc_last = curve8_fwd::<false>(w, dt_last, s, sf, d, wc, ln8::<false>(s), ln8::<false>(sf));
     // Reverse pass. The final state's adjoint is 0, so at the last step the stab/next_d backward
     // all multiply 0 -> only curve8_bwd(loss-adjoint) contributes. BIT-FOR-BIT identical to a full
     // step8_bwd with g_out=0. The clamp gate uses the UNCLAMPED incoming state (= s0/d0/sf0).
     let mut gw_g = [z; 34];
     let g_rraw_last = g_r_loss_at(fc_last.out, weights, labels, lbase);
-    let (g_ls, g_lsf, g_ld) = curve8_bwd(w, &fc_last, dt_last, s, sf, d, g_rraw_last, z, &mut gw_g, wc);
-    let mut g_s = (s.cmp_gt(k(S_MIN)) & s.cmp_lt(k(S_MAX))).blend(g_ls, z);
-    let mut g_d = (d.cmp_gt(k(D_MIN)) & d.cmp_lt(k(D_MAX))).blend(g_ld, z);
-    let mut g_sf = (sf.cmp_gt(k(S_MIN)) & sf.cmp_lt(k(S_MAX))).blend(g_lsf, z);
+    // Ungated, like step8_bwd's input adjoints (the previous step's backward applies the mask).
+    let (mut g_s, mut g_sf, mut g_d) =
+        curve8_bwd(w, &fc_last, dt_last, s, sf, d, g_rraw_last, z, &mut gw_g, wc);
     for (t, cache) in caches.iter().enumerate().skip(1).rev() {
         let g_r_loss = g_r_loss_at(cache.curve_out(), weights, labels, t * batch + c0);
         (g_s, g_d, g_sf) = step8_bwd(w, cache, (g_s, g_d, g_sf), g_r_loss, &mut gw_g, wc);
