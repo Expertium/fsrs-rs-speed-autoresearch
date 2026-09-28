@@ -743,26 +743,28 @@ fn curve8_bwd(
     // r2 = b2^decay2, b2 = q2 + 1 with q2 = (t/s)*factor2*ex34 (ex34 = exp((d-5)*(d_decay-0.3)),
     // factor2 = p28 - 1, p28 = base2[w26]^(1/decay2), decay2 = -clamp(w24)). q2 is a product, so
     // the adjoints of ln(t/s), ln(ex34) and ln(factor2) are all x2 = g_b2*q2.
-    let g_b2 = g_r2 * wc.decay2 * (c.r2 / c.b2);
-    let x2 = g_b2 * c.q2;
+    let v2 = g_r2 * c.r2; // adjoint of ln(r2) = decay2 * ln(b2)
+    let x2 = v2 * wc.decay2 / c.b2 * c.q2;
     g_d += x2 * (sp(32) - k(0.3));
     gw[32] += x2 * (d - k(5.0));
     // w26 and w24 enter r2 only through weight-only factors: slot 26 holds sum(x2), slot 28 the
     // direct decay2 term; finish_gw forms gw[26] and gw[24] from them.
     gw[26] += x2;
-    gw[28] += g_r2 * c.r2 * c.ln_b2;
+    gw[28] += v2 * c.ln_b2;
     // r1 = b1^decay1, b1 = a*factor1 + 1, a = t/sf, factor1 = e1 - 1, e1 = exp(min(q1, 60)),
     // q1 = ln(base1[w25]) / decay1, decay1 = -clamp(w23 * p35), p35 = sf^(s_decay1[w33]-0.3).
-    let g_b1 = g_r1 * decay1 * (c.r1 / b1);
-    let mut g_decay1 = g_r1 * c.r1 * c.ln_b1;
-    let g_a_a = g_b1 * factor1 * c.a; // adjoint of ln(a)
-    let g_q1 = c.q1.cmp_lt(k(60.0)).blend(g_b1 * c.a * c.e1, z);
+    let v1 = g_r1 * c.r1; // adjoint of ln(r1) = decay1 * ln(b1)
+    let mut g_decay1 = v1 * c.ln_b1;
+    let g_b1_a = v1 * decay1 / b1 * c.a; // adjoint of b1, times a
+    let g_a_a = g_b1_a * factor1; // adjoint of ln(a)
+    let g_q1 = c.q1.cmp_lt(k(60.0)).blend(g_b1_a * c.e1, z);
     let g_lw27 = g_q1 / decay1;
     g_decay1 -= g_lw27 * c.q1; // d(q1)/d(decay1) = -q1/decay1
     gw[25] += g_lw27; // ln_base1 = ln(w[25]); finish_gw applies 1/w25
     let g_m1 = (m1.cmp_gt(k(0.01)) & m1.cmp_lt(k(0.95))).blend(z - g_decay1, z);
-    gw[23] += g_m1 * c.p35;
-    let y = g_m1 * sp(23) * c.p35; // adjoint of ln(p35)
+    let u = g_m1 * c.p35;
+    gw[23] += u;
+    let y = u * sp(23); // adjoint of ln(p35)
     gw[33] += y * c.ln_sf;
     // d/ds and d/dsf of every ln(s)/ln(sf) term, over ONE division each.
     let g_s = (g_z * sp(30) - x2) / s;
@@ -789,6 +791,9 @@ struct Stab8 {
     pr: f32x8,
     qbase: f32x8,
     ln_ls1: f32x8,
+    /// The post-lapse branch was computed (some lane lapsed or tied); else nsf_fail/pr/qbase/ln_ls1
+    /// are 0 and unused.
+    full: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -801,6 +806,21 @@ fn stab8_fwd<const FAST: bool>(
     let k = f32x8::splat;
     let one = k(1.0);
     let he = hard_easy8(w, rating, start);
+    let bb = k(11.0) - last_d;
+    let cc = exp8_in_range::<FAST>(k(-w[start + 1]) * ln_ls);
+    let expr = exp8_in_range::<FAST>((one - r) * sp(start + 2));
+    let aa8 = k(aa);
+    let sinc = aa8 * bb * cc * (expr - one) * he + one;
+    let ls_sinc = last_s * sinc;
+    // sinc >= 1, so ls_sinc >= last_s >= pls = min(last_s, nsf_fail): on a success lane the new
+    // stability max(pls, ls_sinc) is ls_sinc and pls takes the gradient only on a tie. So the
+    // post-lapse branch (a ln and two exps) is needed only if some lane lapses or ties; the value
+    // of a padding lane (rating 0) is never used (step8 PAD / trailing weight-0 padding).
+    let full = (rating.cmp_eq(one) | ls_sinc.cmp_eq(last_s)).any();
+    if !full {
+        let z = k(0.0);
+        return Stab8 { out: ls_sinc, nsf_fail: z, sinc, cc, expr, pr: z, qbase: z, ln_ls1: z, full };
+    }
     let ln_ls1 = ln8::<FAST>(last_s + one);
     let qbase = exp8_in_range::<FAST>(sp(start + 4) * ln_ls1); // (last_s+1)^fail_s_exp[start+4]
     // fail_d_exp DROPPED: post-lapse stability is D-independent, so the legacy `pr` cache field now
@@ -808,15 +828,9 @@ fn stab8_fwd<const FAST: bool>(
     let pr = exp8_in_range::<FAST>((one - r) * sp(start + 5)); // rexp = exp((1-r)*fail_r_mult[start+5])
     let nsf_fail = sp(start + 3) * pr * (qbase - one);
     let pls = last_s.fast_min(nsf_fail);
-    let bb = k(11.0) - last_d;
-    let cc = exp8_in_range::<FAST>(k(-w[start + 1]) * ln_ls);
-    let expr = exp8_in_range::<FAST>((one - r) * sp(start + 2));
-    let aa8 = k(aa);
-    let sinc = aa8 * bb * cc * (expr - one) * he + one;
-    let ls_sinc = last_s * sinc;
     let nss = pls.fast_max(ls_sinc);
     let out = rating.cmp_gt(one).blend(nss, pls);
-    Stab8 { out, nsf_fail, sinc, cc, expr, pr, qbase, ln_ls1 }
+    Stab8 { out, nsf_fail, sinc, cc, expr, pr, qbase, ln_ls1, full }
 }
 
 /// VJP of stab8_fwd (f32x8 analogue of stab_bwd). Returns (g_last_s, g_last_d, g_r).
@@ -833,34 +847,40 @@ fn stab8_bwd(
     // aa / hard / easy / ln_ls are recomputed or passed in (not cached): the same values stab8_fwd used.
     let aa = k(aa);
     let he = hard_easy8(w, rating, start);
-    let pls = last_s.fast_min(c.nsf_fail);
-    let ls_sinc = last_s * c.sinc;
     let bb = k(11.0) - last_d;
     let gt1 = rating.cmp_gt(one);
     let g_nss = gt1.blend(g_out, z);
-    let g_pls_direct = gt1.blend(z, g_out);
-    // nss = max(pls, ls_sinc)  (ties to pls, matching the scalar >= / > split)
-    let g_pls_from_nss = pls.cmp_ge(ls_sinc).blend(g_nss, z);
-    let g_ls_sinc = ls_sinc.cmp_gt(pls).blend(g_nss, z);
-    let mut g_last_s = g_ls_sinc * c.sinc;
+    // Without the post-lapse branch (see stab8_fwd) every success lane routes to ls_sinc, and the
+    // other lanes carry a zero adjoint.
+    let (mut g_last_s, g_ls_sinc, g_nsf_fail) = if c.full {
+        let pls = last_s.fast_min(c.nsf_fail);
+        let ls_sinc = last_s * c.sinc;
+        let g_pls_direct = gt1.blend(z, g_out);
+        // nss = max(pls, ls_sinc)  (ties to pls, matching the scalar >= / > split)
+        let g_pls_from_nss = pls.cmp_ge(ls_sinc).blend(g_nss, z);
+        let g_ls_sinc = ls_sinc.cmp_gt(pls).blend(g_nss, z);
+        let g_pls = g_pls_direct + g_pls_from_nss;
+        // pls = min(last_s, nsf_fail)
+        let g_ls = last_s.cmp_le(c.nsf_fail).blend(g_pls, z);
+        (g_ls, g_ls_sinc, c.nsf_fail.cmp_lt(last_s).blend(g_pls, z))
+    } else {
+        (z, g_nss, z)
+    };
+    g_last_s += g_ls_sinc * c.sinc;
     let g_sinc = g_ls_sinc * last_s;
-    let g_pls = g_pls_direct + g_pls_from_nss;
-    // pls = min(last_s, nsf_fail)
-    g_last_s += last_s.cmp_le(c.nsf_fail).blend(g_pls, z);
-    let g_nsf_fail = c.nsf_fail.cmp_lt(last_s).blend(g_pls, z);
     // sinc = aa*bb*cc*(expr-1)*hard*easy + 1
     let em1 = c.expr - one;
     let g_prod = g_sinc;
     let base = aa * bb * c.cc * em1;
-    let prod = base * he;
-    // prod is a product, so the adjoint of ln(aa) and of ln(cc) are both g_prod * prod.
-    let p_ln = g_prod * prod;
-    gw[start] += p_ln; // aa = exp(w[start]-1.5)
-    let g_bb = g_prod * (aa * c.cc * em1 * he);
-    let g_em1 = g_prod * (aa * bb * c.cc * he);
     // d(prod)/d(hard_penalty) on rating-2 lanes and d(prod)/d(easy_bonus) on rating-4 lanes are
     // both `base` (the other factor is exactly 1 there).
     let g_base = g_prod * base;
+    // prod = base * he is a product, so the adjoint of ln(aa) and of ln(cc) are both g_prod * prod.
+    let p_ln = g_base * he;
+    gw[start] += p_ln; // aa = exp(w[start]-1.5)
+    let g_he = g_prod * he;
+    let g_bb = g_he * (aa * c.cc * em1);
+    let g_em1 = g_he * (aa * bb * c.cc);
     gw[start + 6] += rating.cmp_eq(k(2.0)).blend(g_base, z); // hard_penalty
     gw[start + 7] += rating.cmp_eq(k(4.0)).blend(g_base, z); // easy_bonus
     let g_last_d = g_bb * (z - one); // bb = 11 - last_d (the ONLY D-dependence of stab now)
@@ -870,6 +890,9 @@ fn stab8_bwd(
     // expr = exp((1-r)*w[start+2])
     let mut g_r = g_em1 * c.expr * k(-w[start + 2]);
     gw[start + 2] += g_em1 * c.expr * (one - r);
+    if !c.full {
+        return (g_last_s, g_last_d, g_r);
+    }
     // nsf_fail = fail_mult[start+3] * pr * (qbase-1) ; pr = rexp = exp((1-r)*fail_r_mult[start+5])
     // (fail_d_exp DROPPED: no pp = last_d^-x factor, so nsf_fail is D-independent).
     // The adjoint of ln(fail_mult) and of ln(pr) are both n_ln = g_nsf_fail * nsf_fail.
@@ -1056,7 +1079,7 @@ impl Step8 {
 /// batch_loss_simd; otherwise it mirrors step_fwd (curve + both stability traces + next-difficulty,
 /// then the rating==0 padding passthrough). Returns the new state and the backward cache.
 #[inline(always)]
-fn step8_fwd<const FAST: bool>(
+fn step8_fwd<const FAST: bool, const PAD: bool>(
     w: &[f32], dt_raw: f32x8, rating: f32x8, state: (f32x8, f32x8, f32x8), first: bool, wc: &WConsts,
 ) -> ((f32x8, f32x8, f32x8), Step8) {
     let k = f32x8::splat;
@@ -1091,11 +1114,17 @@ fn step8_fwd<const FAST: bool>(
         let (nd, nd_out_pre, nd_delta_d) = next_d8_fwd(w, last_d, rating, r, wc.init);
         // POST-LAPSE short reset (iter-97): on a lapse cap s_short at 0.8 * post-lapse s_long.
         let nsf_pre = rating.cmp_eq(one).blend(fast.out.fast_min(k(0.8) * slow.out), fast.out);
-        // rating==0 (padding) passes the input state through unchanged.
-        let m0 = rating.cmp_eq(k(0.0));
-        let ns3 = m0.blend(last_s, slow.out);
-        let nsf3 = m0.blend(last_sf, nsf_pre);
-        let nd3 = m0.blend(last_d, nd);
+        // PAD: rating==0 (padding) passes the input state through unchanged. Needed where a state is
+        // read AFTER trailing padding (the O(N^2) paths score the final state). The windowed path
+        // (PAD = false) never does: a card's padding only trails it, carries weight 0, and lanes are
+        // independent, so padding lanes may evolve (their values stay finite: rating 0 takes the
+        // clamped post-lapse branch) and contribute only zero gradients.
+        let (ns3, nsf3, nd3) = if PAD {
+            let m0 = rating.cmp_eq(k(0.0));
+            (m0.blend(last_s, slow.out), m0.blend(last_sf, nsf_pre), m0.blend(last_d, nd))
+        } else {
+            (slow.out, nsf_pre, nd)
+        };
         let out = (clamp8(ns3, S_MIN, S_MAX), nd3, clamp8(nsf3, S_MIN, S_MAX));
         (
             out,
@@ -1113,7 +1142,7 @@ fn step8_fwd<const FAST: bool>(
 /// feeds the loss AND both stability traces. The O(N^2) callers pass 0 (their loss is the separate
 /// final curve). The First variant ignores it (t==0 makes no prediction).
 #[inline(always)]
-fn step8_bwd(
+fn step8_bwd<const PAD: bool>(
     w: &[f32], c: &Step8, g_out: (f32x8, f32x8, f32x8), g_r_loss: f32x8, gw: &mut [f32x8; 34], wc: &WConsts,
 ) -> (f32x8, f32x8, f32x8) {
     let k = f32x8::splat;
@@ -1143,20 +1172,23 @@ fn step8_bwd(
         } => {
             // Cheap forward values recomputed with step8_fwd's exact ops (smaller per-step cache).
             let (last_s, last_d, last_sf) = (*s0, *d0, *sf0); // already clamped (see step8_fwd)
-            let m0 = rating.cmp_eq(z);
-            let ns3 = m0.blend(last_s, slow.out);
             let nsf_pre = rating.cmp_eq(one).blend(fast.out.fast_min(k(0.8) * slow.out), fast.out);
-            let nsf3 = m0.blend(last_sf, nsf_pre);
+            // PAD: rating==0 padding passes the state through (output == input), so its adjoint
+            // flows straight through (see step8_fwd; the windowed path does not need this).
+            let m0 = rating.cmp_eq(z);
+            let (ns3, nsf3) = if PAD {
+                (m0.blend(last_s, slow.out), m0.blend(last_sf, nsf_pre))
+            } else {
+                (slow.out, nsf_pre)
+            };
             let g_ns3 = (ns3.cmp_gt(k(S_MIN)) & ns3.cmp_lt(k(S_MAX))).blend(g_ns_out, z);
             let g_nsf3 = (nsf3.cmp_gt(k(S_MIN)) & nsf3.cmp_lt(k(S_MAX))).blend(g_nsf_out, z);
             let g_nd3 = g_nd_out;
-            // rating==0 padding: output state == input state, so the adjoint flows straight through.
-            let g_ns2 = m0.blend(z, g_ns3);
-            let g_nsf2 = m0.blend(z, g_nsf3); // adjoint on nsf_pre
-            let g_nd2 = m0.blend(z, g_nd3);
-            let g_last_s_extra = m0.blend(g_ns3, z);
-            let g_last_sf_extra = m0.blend(g_nsf3, z);
-            let g_last_d_extra = m0.blend(g_nd3, z);
+            let (g_ns2, g_nsf2, g_nd2) = if PAD {
+                (m0.blend(z, g_ns3), m0.blend(z, g_nsf3), m0.blend(z, g_nd3))
+            } else {
+                (g_ns3, g_nsf3, g_nd3)
+            };
             // POST-LAPSE min routing: nsf_pre = (rating==1)? min(fast.out, 0.8*slow.out) : fast.out.
             let is_lapse = rating.cmp_eq(one);
             let fast_wins = fast.out.cmp_le(k(0.8) * slow.out);
@@ -1180,9 +1212,14 @@ fn step8_bwd(
                 w, curve, last_s, last_sf, last_d, g_r_long + g_r_loss + g_r_nextd, g_r1_short,
                 gw, wc,
             );
-            let g_last_s = g_ls_a + g_ls_d + g_last_s_extra;
-            let g_last_sf = g_lsf_b + g_lsf_d + g_last_sf_extra;
-            let g_last_d = g_ld_a + g_ld_b + g_ld_c + g_ld_d + g_last_d_extra;
+            let mut g_last_s = g_ls_a + g_ls_d;
+            let mut g_last_sf = g_lsf_b + g_lsf_d;
+            let mut g_last_d = g_ld_a + g_ld_b + g_ld_c + g_ld_d;
+            if PAD {
+                g_last_s += m0.blend(g_ns3, z);
+                g_last_sf += m0.blend(g_nsf3, z);
+                g_last_d += m0.blend(g_nd3, z);
+            }
             // No clamp gate here: s0/d0/sf0 are the previous step's clamped outputs, and that step's
             // backward applies the same mask to this adjoint (S_MIN < x < S_MAX holds for the
             // clamped value exactly when it holds for the unclamped one; a padding passthrough
@@ -1228,7 +1265,7 @@ fn loss_and_grad_range_simd(
             let base = t * batch + c0;
             let rating = load8(r_hist, base);
             let dt = if t == 0 { k(0.0) } else { load8(t_hist, base) };
-            let (ns, cache) = step8_fwd::<false>(w, dt, rating, (s, d, sf), t == 0, &wc);
+            let (ns, cache) = step8_fwd::<false, true>(w, dt, rating, (s, d, sf), t == 0, &wc);
             s = ns.0;
             d = ns.1;
             sf = ns.2;
@@ -1252,7 +1289,7 @@ fn loss_and_grad_range_simd(
         for t in (0..sl).rev() {
             // O(N^2) path: the only loss is the final curve (handled above), so no per-step adjoint.
             let (gs0, gd0, gsf0) =
-                step8_bwd(w, &caches[t], (g_s, g_d, g_sf), f32x8::splat(0.0), &mut gw_g, &wc);
+                step8_bwd::<true>(w, &caches[t], (g_s, g_d, g_sf), f32x8::splat(0.0), &mut gw_g, &wc);
             g_s = gs0;
             g_d = gd0;
             g_sf = gsf0;
@@ -1362,13 +1399,13 @@ pub(crate) fn card_group_grad(
     // next-difficulty update feeds no t+1, so we compute its curve only (just below) — exactly
     // like card_loss_simd's validation skip-last. The first review (t==0) is peeled off, so the
     // loop body has no t==0 branch.
-    let (ns, cache) = step8_fwd::<false>(w, z, load8(r_hist, c0), (s, d, sf), true, wc);
+    let (ns, cache) = step8_fwd::<false, false>(w, z, load8(r_hist, c0), (s, d, sf), true, wc);
     (s, d, sf) = ns;
     caches.push(cache);
     for t in 1..seq_len - 1 {
         let base = t * batch + c0;
         let (ns, cache) =
-            step8_fwd::<false>(w, load8(t_hist, base), load8(r_hist, base), (s, d, sf), false, wc);
+            step8_fwd::<false, false>(w, load8(t_hist, base), load8(r_hist, base), (s, d, sf), false, wc);
         (s, d, sf) = ns;
         caches.push(cache);
     }
@@ -1387,10 +1424,10 @@ pub(crate) fn card_group_grad(
         curve8_bwd(w, &fc_last, s, sf, d, g_rraw_last, z, &mut gw_g, wc);
     for (t, cache) in caches.iter().enumerate().skip(1).rev() {
         let g_r_loss = g_r_loss_at(cache.curve_out(), weights, labels, t * batch + c0);
-        (g_s, g_d, g_sf) = step8_bwd(w, cache, (g_s, g_d, g_sf), g_r_loss, &mut gw_g, wc);
+        (g_s, g_d, g_sf) = step8_bwd::<false>(w, cache, (g_s, g_d, g_sf), g_r_loss, &mut gw_g, wc);
     }
     // init step (t==0): no prediction (min surviving prefix length is 2).
-    step8_bwd(w, &caches[0], (g_s, g_d, g_sf), z, &mut gw_g, wc);
+    step8_bwd::<false>(w, &caches[0], (g_s, g_d, g_sf), z, &mut gw_g, wc);
     finish_gw(&gw_g, w, wc)
 }
 
@@ -1446,7 +1483,7 @@ pub(crate) fn card_loss_simd(
                     MIN_R, MAX_R,
                 )
             } else {
-                let (ns, cache) = step8_fwd::<false>(w, dt, rating, (s, d, sf), t == 0, &wc);
+                let (ns, cache) = step8_fwd::<false, true>(w, dt, rating, (s, d, sf), t == 0, &wc);
                 s = ns.0;
                 d = ns.1;
                 sf = ns.2;

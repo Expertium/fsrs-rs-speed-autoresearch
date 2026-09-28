@@ -46,6 +46,7 @@ Accept metric: **median per-user speed_ratio ≥ 1.05** (constraint 12) AND **sp
 | 39 | 11 | 10 | 1.052 | 10775 | 10869 | 1.009 | 1.022 | ✓ | accepted | Helper lays out batches in training order; no per-step clock reads, allocations, dead penalty value |
 | 40 | 11 | 10 | 1.065 | 10869 | 10907 | 1.004 | 1.009 | ✓ | accepted | Curve mix as sigmoid (one exp fewer) + exact kernel, plan, penalty, Adam trims |
 | 41 | 10 | 9 | 1.053 | 10907 | 10916 | 1.001 | 1.002 | ✓ | accepted | Backward: share product adjoints, merge divisions, apply weight-only factors once per group |
+| 42 | 9 | 8 | 1.097 | 10916 | 10972 | 1.005 | 1.013 | ✓ | accepted | Skip post-lapse branch on lapse-free steps; windowed path drops padding passthrough; share products |
 
-**Cumulative speed_ratio (product of accepted): ×275.256** — upward-biased (winner's curse); anchor periodically vs iter-0 baseline.
+**Cumulative speed_ratio (product of accepted): ×301.874** — upward-biased (winner's curse); anchor periodically vs iter-0 baseline.
 
