@@ -43,6 +43,7 @@ Accept metric: **median per-user speed_ratio ≥ 1.05** (constraint 12) AND **sp
 | 36 | 12 | 11 | 1.071 | 10603 | 10616 | 1.001 | 1.003 | ✓ | accepted | iter35 stack plus: skip re-clamping already-clamped states, drop ln8's redundant exponent mask |
 | 37 | 13 | 10 | 1.086 | 10616 | 10775 | 1.015 | 1.038 | ✓ | accepted | Second thread shares each batch's card groups (dynamic claims), also frees the input items |
 | 38 | 12 | 12 | 0.995 | 10775 | 10788 | 1.001 | 1.004 | ✓ | rejected | exp8: add n to the polynomial's exponent bits instead of multiplying by 2^n |
+| 39 | 11 | 10 | 1.052 | 10775 | 10869 | 1.009 | 1.022 | ✓ | accepted | Helper lays out batches in training order; no per-step clock reads, allocations, dead penalty value |
 
-**Cumulative speed_ratio (product of accepted): ×233.361** — upward-biased (winner's curse); anchor periodically vs iter-0 baseline.
+**Cumulative speed_ratio (product of accepted): ×245.403** — upward-biased (winner's curse); anchor periodically vs iter-0 baseline.
 

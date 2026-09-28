@@ -1,5 +1,5 @@
 use crate::error::Result;
-use crate::model::{clip_parameters, parameters_to_model, Model};
+use crate::model::{clip_parameters, clip_parameters_in_place, parameters_to_model, Model};
 use crate::{DEFAULT_PARAMETERS, FSRSError};
 use burn::LearningRate;
 use burn::backend::Autodiff;
@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 mod training_v7 {
 use crate::model::{S_MAX, S_MIN};
@@ -54,38 +54,35 @@ pub(crate) const PARAMS_STDDEV: [f32; 34] = [
     0.2596, 0.0798, 0.0682, 0.1282, 0.1397, 0.1407, 0.1489, 0.2, 0.15, 0.15,
 ];
 
-pub(crate) fn l2_penalty_value_and_grad(
+/// Gradient of the L2 anchor penalty (training uses only the gradient, so the penalty VALUE is not
+/// computed: its 34 f64 divisions per step were dead work). The old all-zero fallback for a
+/// non-finite penalty needs a non-finite w or init_w, which clip_parameters rules out.
+pub(crate) fn l2_penalty_grad(
     w: &[f32],
     init_w: &[f32],
     batch_size: usize,
     total_size: usize,
     l2_weight: f64,
     params_stddev: &[f32],
-) -> (f64, Vec<f32>) {
+) -> Vec<f32> {
     let mut grad = vec![0.0f32; w.len()];
     if total_size == 0 {
-        return (0.0, grad);
+        return grad;
     }
     let size = w.len().min(init_w.len()).min(params_stddev.len());
     let scale = l2_weight * batch_size as f64 / total_size as f64;
-    let mut penalty_sum = 0.0f64;
     for i in 0..size {
         let sigma = params_stddev[i] as f64;
         let denom = sigma * sigma;
         let diff = w[i] as f64 - init_w[i] as f64;
-        penalty_sum += diff * diff / denom;
         grad[i] = (2.0 * diff / denom * scale) as f32;
-    }
-    let penalty = penalty_sum * scale;
-    if !penalty.is_finite() {
-        return (0.0, vec![0.0; w.len()]);
     }
     for g in &mut grad {
         if !g.is_finite() {
             *g = 0.0;
         }
     }
-    (penalty, grad)
+    grad
 }
 
 // Keep Dual35 local to FSRS-7 training: the penalty objective and its gradients
@@ -604,14 +601,14 @@ const ADAM_BETA2: f32 = 0.98;
 const ADAM_EPS: f32 = 1e-8;
 
 type SchedulePenaltyFn = fn(&[f32], usize, bool) -> (f64, [f64; PENALTY_GRAD_LEN]);
-type L2PenaltyFn = fn(&[f32], &[f32], usize, usize, f64, &[f32]) -> (f64, Vec<f32>);
+type L2PenaltyFn = fn(&[f32], &[f32], usize, usize, f64, &[f32]) -> Vec<f32>;
 
 fn schedule_penalty_fn() -> SchedulePenaltyFn {
     training_v7::maybe_schedule_penalty_value_and_grad
 }
 
 fn l2_penalty_fn() -> L2PenaltyFn {
-    training_v7::l2_penalty_value_and_grad
+    training_v7::l2_penalty_grad
 }
 
 // ========== ModelConfig ==========
@@ -1344,25 +1341,21 @@ pub fn compute_parameters(
     if let Some(lr) = std::env::var("FSRS_LR").ok().and_then(|s| s.trim().parse().ok()) {
         config.learning_rate = lr;
     }
-    // The windowed path hands the prefix-items to train(), whose second thread frees them (one
-    // heap block each, ~10% of a large user's time) while this one trains.
-    let mut garbage = None;
-    let (train_host, total_size) = match train_card_ids {
+    // The windowed path only PLANS the batches here and hands the plan plus the prefix-items to
+    // train(), whose second thread lays the batches out (in the order training uses them) and then
+    // frees the items (one heap block each, ~10% of a large user's time) while this one trains.
+    let (batches, total_size) = match train_card_ids {
         Some(train_card_ids) => {
-            let host = build_host_batches_carded(
-                &train_set,
-                &train_card_ids,
-                config.batch_size,
-                config.max_seq_len,
-            );
-            garbage = Some((train_set, train_card_ids));
-            host
+            let plan =
+                CardedPlan::new(&train_set, &train_card_ids, config.batch_size, config.max_seq_len);
+            let total_size = plan.n_preds;
+            (TrainBatches::Planned(plan, train_set, train_card_ids), total_size)
         }
         None => {
             let mut weighted_train_set = recency_weighted_fsrs_items_tuned(train_set);
             weighted_train_set.retain(|item| item.item.reviews.len() <= config.max_seq_len);
             let total_size = weighted_train_set.len();
-            (build_host_batches(weighted_train_set, config.batch_size), total_size)
+            (TrainBatches::Built(build_host_batches(weighted_train_set, config.batch_size)), total_size)
         }
     };
 
@@ -1376,9 +1369,8 @@ pub fn compute_parameters(
         progress.lock().unwrap().splits = vec![progress_state];
     }
     let model = train::<Autodiff<B>>(
-        train_host,
+        batches,
         total_size,
-        garbage,
         &initialized_parameters,
         &config,
         progress.clone().map(|p| ProgressCollector::new(p, 0)),
@@ -1485,9 +1477,8 @@ pub fn benchmark(
     weighted_train_set.retain(|item| item.item.reviews.len() <= config.max_seq_len);
     let total_size = weighted_train_set.len();
     let model = train::<Autodiff<B>>(
-        build_host_batches(weighted_train_set, config.batch_size),
+        TrainBatches::Built(build_host_batches(weighted_train_set, config.batch_size)),
         total_size,
-        None,
         &initialized_parameters,
         &config,
         None,
@@ -1567,110 +1558,141 @@ impl std::hash::Hasher for CardIdHasher {
     }
 }
 
-/// Windowed path (card ids present): build the train batches straight from the prefix-items. Each
-/// card becomes ONE column holding its FULL review sequence, taken from its longest surviving prefix
+/// Windowed path (card ids present): the batch PLAN built straight from the prefix-items. Each card
+/// becomes ONE column holding its FULL review sequence, taken from its longest surviving prefix
 /// (every shorter prefix is a head of it). A surviving prefix of length L (<= max_seq_len) predicts
 /// review L-1, so its recency weight goes to wts[(L-1)*bsz + c] (label likewise); every other (t, c)
 /// stays weight 0 (a filtered middle prefix, t==0, or padding). Cards are ordered by (full length,
 /// card id) — a total order, so the batches are reproducible and length-similar (less SIMD padding)
 /// — and WHOLE cards are packed into batches of at most `batch_size` predictions, so each Adam step
-/// sees a whole card's predictions together. Only per-card indices are gathered: no prefix-item is
-/// copied or regrouped, and delta_t is clamped (as normalize_training_set does) only for the
-/// reviews laid out. Returns the batches and the surviving prefix-item count.
-fn build_host_batches_carded(
-    items: &[FSRSItem],
-    card_ids: &[i64],
-    batch_size: usize,
-    max_seq_len: usize,
-) -> (Vec<BatchHost>, usize) {
-    struct Card {
-        id: i64,
-        full_len: usize,
-        longest: usize,
-        n_preds: usize,
-    }
-    // One pass in input order over the item headers only (a prefix's label is the rating of review
-    // t of its card's longest prefix, read at layout time — no per-item heap access here): each
-    // surviving prefix-item becomes a compact prediction record.
-    struct Pred {
-        card: u32,
-        t: u32,
-        weight: f32,
-    }
-    let weight = recency_weight_tuned();
-    let length = (items.len() as f32).max(1.0);
-    let mut card_index: HashMap<i64, usize, BuildHasherDefault<CardIdHasher>> = HashMap::default();
-    let mut cards: Vec<Card> = Vec::new();
-    let mut preds: Vec<Pred> = Vec::with_capacity(items.len());
-    for (idx, (item, &id)) in items.iter().zip(card_ids).enumerate() {
-        let len = item.reviews.len();
-        if len > max_seq_len {
-            continue;
-        }
-        let ci = *card_index.entry(id).or_insert_with(|| {
-            cards.push(Card { id, full_len: 0, longest: 0, n_preds: 0 });
-            cards.len() - 1
-        });
-        let card = &mut cards[ci];
-        // >= keeps the LAST longest prefix (max_by_key's tie rule).
-        if len >= card.full_len {
-            card.full_len = len;
-            card.longest = idx;
-        }
-        card.n_preds += 1;
-        preds.push(Pred { card: ci as u32, t: len as u32 - 1, weight: weight(idx, length) });
-    }
-    // Each card's predictions, contiguous and in input order (a counting sort).
-    let mut start = vec![0usize; cards.len() + 1];
-    for (ci, card) in cards.iter().enumerate() {
-        start[ci + 1] = start[ci] + card.n_preds;
-    }
-    let mut fill = start.clone();
-    let mut by_card: Vec<(usize, f32)> = vec![(0, 0.0); preds.len()];
-    for p in &preds {
-        by_card[fill[p.card as usize]] = (p.t as usize, p.weight);
-        fill[p.card as usize] += 1;
-    }
-    let mut order: Vec<usize> = (0..cards.len()).collect();
-    order.sort_unstable_by_key(|&ci| (cards[ci].full_len, cards[ci].id));
+/// sees a whole card's predictions together. The plan reads only item headers; `layout` then fills
+/// one batch's arrays (reading each card's longest prefix, clamping delta_t as
+/// normalize_training_set does), so train() can lay out batches on its second thread.
+struct CardedPlan {
+    cards: Vec<PlanCard>,
+    /// Each card's predictions (t, item index), contiguous per card and in input order.
+    start: Vec<usize>,
+    by_card: Vec<(u32, u32)>,
+    order: Vec<usize>,
+    /// Each batch = order[first..end].
+    bounds: Vec<(usize, usize)>,
+    n_items: usize,
+    n_preds: usize,
+}
 
-    let build = |batch: &[usize]| {
-        let bsz = batch.len().div_ceil(8) * 8;
-        let seq = batch.iter().map(|&ci| cards[ci].full_len).max().unwrap_or(0);
+struct PlanCard {
+    id: i64,
+    full_len: usize,
+    longest: usize,
+    n_preds: usize,
+}
+
+impl CardedPlan {
+    fn new(items: &[FSRSItem], card_ids: &[i64], batch_size: usize, max_seq_len: usize) -> Self {
+        // One pass in input order over the item headers only (a prefix's label is the rating of
+        // review t of its card's longest prefix, and its weight depends only on its index, so both
+        // are read at layout time — no per-item heap access here).
+        let mut card_index: HashMap<i64, usize, BuildHasherDefault<CardIdHasher>> = HashMap::default();
+        let mut cards: Vec<PlanCard> = Vec::new();
+        let mut preds: Vec<(u32, u32, u32)> = Vec::with_capacity(items.len()); // (card, t, idx)
+        for (idx, (item, &id)) in items.iter().zip(card_ids).enumerate() {
+            let len = item.reviews.len();
+            if len > max_seq_len {
+                continue;
+            }
+            let ci = *card_index.entry(id).or_insert_with(|| {
+                cards.push(PlanCard { id, full_len: 0, longest: 0, n_preds: 0 });
+                cards.len() - 1
+            });
+            let card = &mut cards[ci];
+            // >= keeps the LAST longest prefix (max_by_key's tie rule).
+            if len >= card.full_len {
+                card.full_len = len;
+                card.longest = idx;
+            }
+            card.n_preds += 1;
+            preds.push((ci as u32, len as u32 - 1, idx as u32));
+        }
+        // Each card's predictions, contiguous and in input order (a counting sort).
+        let mut start = vec![0usize; cards.len() + 1];
+        for (ci, card) in cards.iter().enumerate() {
+            start[ci + 1] = start[ci] + card.n_preds;
+        }
+        let mut fill = start.clone();
+        let mut by_card = vec![(0u32, 0u32); preds.len()];
+        for &(ci, t, idx) in &preds {
+            by_card[fill[ci as usize]] = (t, idx);
+            fill[ci as usize] += 1;
+        }
+        let mut order: Vec<usize> = (0..cards.len()).collect();
+        order.sort_unstable_by_key(|&ci| (cards[ci].full_len, cards[ci].id));
+        let mut bounds = Vec::new();
+        let (mut first, mut current_preds) = (0, 0);
+        for (k, &ci) in order.iter().enumerate() {
+            if k > first && current_preds + cards[ci].n_preds > batch_size {
+                bounds.push((first, k));
+                (first, current_preds) = (k, 0);
+            }
+            current_preds += cards[ci].n_preds;
+        }
+        if first < order.len() {
+            bounds.push((first, order.len()));
+        }
+        Self { cards, start, by_card, order, bounds, n_items: items.len(), n_preds: preds.len() }
+    }
+
+    /// Padded column count of batch `b` (a multiple of 8: the SIMD kernels' 8-card groups).
+    fn bsz(&self, b: usize) -> usize {
+        (self.bounds[b].1 - self.bounds[b].0).div_ceil(8) * 8
+    }
+
+    fn layout(&self, items: &[FSRSItem], b: usize, weight: &impl Fn(usize, f32) -> f32) -> BatchHost {
+        let (first, end) = self.bounds[b];
+        let batch = &self.order[first..end];
+        let length = (self.n_items as f32).max(1.0);
+        let bsz = self.bsz(b);
+        let seq = batch.iter().map(|&ci| self.cards[ci].full_len).max().unwrap_or(0);
         let mut th = vec![0.0f32; seq * bsz];
         let mut rh = vec![0.0f32; seq * bsz];
         let mut lbl = vec![0.0f32; seq * bsz];
         let mut wts = vec![0.0f32; seq * bsz];
         let mut predictions = 0;
         for (c, &ci) in batch.iter().enumerate() {
-            let reviews = &items[cards[ci].longest].reviews;
+            let reviews = &items[self.cards[ci].longest].reviews;
             for (t, r) in reviews.iter().enumerate() {
                 th[t * bsz + c] = r.delta_t.max(0.0);
                 rh[t * bsz + c] = r.rating as f32;
             }
-            for &(t, weight) in &by_card[start[ci]..start[ci + 1]] {
-                wts[t * bsz + c] = weight;
+            for &(t, idx) in &self.by_card[self.start[ci]..self.start[ci + 1]] {
+                let t = t as usize;
+                wts[t * bsz + c] = weight(idx as usize, length);
                 lbl[t * bsz + c] = if reviews[t].rating == 1 { 0.0 } else { 1.0 };
             }
-            predictions += cards[ci].n_preds;
+            predictions += self.cards[ci].n_preds;
         }
         BatchHost {
             seq, bsz, real_batch_size: predictions, th, rh, dts: Vec::new(), lbl, wts, windowed: true,
         }
-    };
-    let mut batches = Vec::new();
-    let (mut first, mut current_preds) = (0, 0);
-    for (k, &ci) in order.iter().enumerate() {
-        if k > first && current_preds + cards[ci].n_preds > batch_size {
-            batches.push(build(&order[first..k]));
-            (first, current_preds) = (k, 0);
-        }
-        current_preds += cards[ci].n_preds;
     }
-    if first < order.len() {
-        batches.push(build(&order[first..]));
-    }
-    (batches, preds.len())
+}
+
+/// All windowed batches on the calling thread (the tuner proxy); returns them and the prefix count.
+fn build_host_batches_carded(
+    items: &[FSRSItem],
+    card_ids: &[i64],
+    batch_size: usize,
+    max_seq_len: usize,
+) -> (Vec<BatchHost>, usize) {
+    let plan = CardedPlan::new(items, card_ids, batch_size, max_seq_len);
+    let weight = recency_weight_tuned();
+    ((0..plan.bounds.len()).map(|b| plan.layout(items, b, &weight)).collect(), plan.n_preds)
+}
+
+/// train()'s batches: already laid out (plain path), or a windowed plan that train()'s second
+/// thread lays out (it owns the prefix-items and frees them afterwards).
+enum TrainBatches {
+    Built(Vec<BatchHost>),
+    Planned(CardedPlan, Vec<FSRSItem>, Vec<i64>),
 }
 
 /// Build the per-batch host arrays of the plain path (no card ids: the benchmark()/evaluate()
@@ -1687,7 +1709,8 @@ fn build_host_batches(items: Vec<WeightedFSRSItem>, batch_size: usize) -> Vec<Ba
 /// then adds the groups in group order, so the result is bit-for-bit the one-thread sum. Batches
 /// take tens of microseconds, so the threads spin (spin_loop) instead of sleeping.
 struct GradShared<'a> {
-    host: &'a [BatchHost],
+    /// Filled once each: all at once (plain path) or by the helper's layout (windowed path).
+    host: &'a [OnceLock<BatchHost>],
     /// (job sequence << 32) | next group to claim. The sequence in the same word keeps a thread
     /// that is still in an old job from claiming a group of the new one. JOB_STOP ends the helper.
     job: AtomicU64,
@@ -1702,7 +1725,7 @@ const JOB_STOP: u64 = u64::MAX;
 impl GradShared<'_> {
     /// Claim and compute groups of job `seq` until none is left (or the job changed).
     fn work(&self, seq: u32, w: &[f32], wc: &crate::analytic::WConsts, caches: &mut Vec<crate::analytic::Step8>) {
-        let hb = &self.host[self.batch.load(Ordering::Relaxed)];
+        let hb = self.host[self.batch.load(Ordering::Relaxed)].get().expect("published batch");
         let n = hb.bsz / 8;
         loop {
             let v = self.job.load(Ordering::Acquire);
@@ -1725,9 +1748,14 @@ impl GradShared<'_> {
         }
     }
 
-    /// The second thread: free the prefix-items, then help with every published job.
-    fn helper<G>(&self, garbage: G) {
-        drop(garbage);
+    /// The second thread: lay out the windowed batches in the order training first uses them, free
+    /// the prefix-items, then help with every published job.
+    fn helper(&self, plan: CardedPlan, items: Vec<FSRSItem>, card_ids: Vec<i64>, first_order: &[usize]) {
+        let weight = recency_weight_tuned();
+        for &b in first_order {
+            let _ = self.host[b].set(plan.layout(&items, b, &weight));
+        }
+        drop((plan, items, card_ids));
         let mut caches = Vec::new();
         let mut seen = 0u32;
         loop {
@@ -1749,9 +1777,8 @@ impl GradShared<'_> {
 }
 
 fn train<B: AutodiffBackend>(
-    train_host: Vec<BatchHost>,
+    batches: TrainBatches,
     total_size: usize,
-    garbage: Option<(Vec<FSRSItem>, Vec<i64>)>,
     initial_parameters: &[f32],
     config: &TrainingConfig,
     progress: Option<ProgressCollector>,
@@ -1762,7 +1789,13 @@ fn train<B: AutodiffBackend>(
     // epoch — only the batch ORDER reshuffles per epoch. (The per-epoch validation pass + its
     // best-epoch selection were REMOVED: training ships the last epoch's parameters, with the
     // 9-epoch default compensating — see the return at the bottom.)
-    let n_train_batches = train_host.len();
+    let (n_train_batches, max_bsz) = match &batches {
+        TrainBatches::Built(host) => (host.len(), host.iter().map(|hb| hb.bsz).max().unwrap_or(0)),
+        TrainBatches::Planned(plan, ..) => {
+            (plan.bounds.len(), (0..plan.bounds.len()).map(|b| plan.bsz(b)).max().unwrap_or(0))
+        }
+    };
+    let train_host: Vec<OnceLock<BatchHost>> = (0..n_train_batches).map(|_| OnceLock::new()).collect();
     // Cosine-annealing horizon = the TRUE step count (faithful to CUDA, which clamps progress
     // over the exact per-user total). The old `(total/batch + 1) * epochs` estimate undercounts
     // windowed batches (whole cards never split, so batches under-fill) — the schedule then hit
@@ -1772,6 +1805,10 @@ fn train<B: AutodiffBackend>(
     // Replicates ShuffleDataLoader's RNG (StdRng::seed_from_u64(seed), advanced one shuffle per
     // epoch) so the per-epoch batch order is byte-identical to the old dataloader path.
     let mut shuffle_rng = StdRng::seed_from_u64(config.seed);
+    // Epoch 1's batch order (the same shuffle the loop below makes, on a clone of the RNG): the
+    // helper lays the windowed batches out in this order.
+    let mut first_order: Vec<usize> = (0..n_train_batches).collect();
+    first_order.shuffle(&mut shuffle_rng.clone());
 
     let mut lr_scheduler = CosineAnnealingLR::init(iterations as f64, config.learning_rate);
     let interrupter = TrainingInterrupter::new();
@@ -1822,22 +1859,31 @@ fn train<B: AutodiffBackend>(
     // t_bwd = analytic gradient, t_opt = hand-rolled Adam + clip. (Per-step extract is gone — the
     // train batches are pre-extracted once into train_host, so that cost is now a one-time floor.)
     let (mut t_pen, mut t_bwd, mut t_opt) = (0.0f64, 0.0f64, 0.0f64);
+    // Timers only under FSRS_PROFILE: 6 clock reads per step were ~2% of a median user's time.
+    let profile = std::env::var_os("FSRS_PROFILE").is_some();
+    let tick = || profile.then(std::time::Instant::now);
+    let secs = |t: Option<std::time::Instant>| t.map_or(0.0, |t| t.elapsed().as_secs_f64());
     let shared = GradShared {
         host: &train_host,
         job: AtomicU64::new(0),
         batch: AtomicUsize::new(0),
         w: std::array::from_fn(|_| AtomicU32::new(0)),
         done: AtomicUsize::new(0),
-        out: (0..train_host.iter().map(|hb| hb.bsz / 8).max().unwrap_or(0))
-            .map(|_| std::array::from_fn(|_| AtomicU32::new(0)))
-            .collect(),
+        out: (0..max_bsz / 8).map(|_| std::array::from_fn(|_| AtomicU32::new(0))).collect(),
     };
-    let two_threads = train_host.iter().any(|hb| hb.windowed);
     let mut caches = Vec::new();
     let mut seq = 0u32;
     std::thread::scope(|scope| {
-    if two_threads {
-        scope.spawn(|| shared.helper(garbage));
+    match batches {
+        TrainBatches::Built(host) => {
+            for (slot, hb) in train_host.iter().zip(host) {
+                let _ = slot.set(hb);
+            }
+        }
+        TrainBatches::Planned(plan, items, card_ids) => {
+            let (shared, first_order) = (&shared, &first_order);
+            scope.spawn(move || shared.helper(plan, items, card_ids, first_order));
+        }
     }
     for epoch in 1..=config.num_epochs {
         // Replicate the dataloader's per-epoch shuffle (one shuffle of [0, n_batches) per epoch).
@@ -1846,14 +1892,20 @@ fn train<B: AutodiffBackend>(
         let mut iteration = 0;
         for &bi in &order {
             iteration += 1;
-            let hb = &train_host[bi];
+            // Laid out by the helper, normally well ahead of use (only the first batch is waited on).
+            let hb = loop {
+                match train_host[bi].get() {
+                    Some(hb) => break hb,
+                    None => std::hint::spin_loop(),
+                }
+            };
             let real_batch_size = hb.real_batch_size;
             let lr = LrScheduler::step(&mut lr_scheduler);
             let progress = Progress::new(iteration, n_train_batches);
-            let _tp = std::time::Instant::now();
-            let w_vec = w_host.clone();
-            let (_l2_penalty_value, mut manual_grad) = l2_penalty(
-                &w_vec,
+            let _tp = tick();
+            let w_vec = &w_host;
+            let mut manual_grad = l2_penalty(
+                w_vec,
                 &init_w_vec,
                 real_batch_size,
                 total_size,
@@ -1861,29 +1913,29 @@ fn train<B: AutodiffBackend>(
                 &training_v7::PARAMS_STDDEV,
             );
             let (_schedule_value, schedule_grad) =
-                schedule_penalty(&w_vec, real_batch_size, config.enable_sched_penalties);
+                schedule_penalty(w_vec, real_batch_size, config.enable_sched_penalties);
             let inv_total = 1.0 / total_size as f64;
             for i in 0..manual_grad.len().min(schedule_grad.len()) {
                 manual_grad[i] += (schedule_grad[i] * inv_total) as f32;
             }
-            t_pen += _tp.elapsed().as_secs_f64();
+            t_pen += secs(_tp);
             // Host batch data was pre-extracted once into train_host (no per-step copy now).
             // Hand-written analytic BCE gradient (replaces the autodiff forward+backward),
             // plus the manual L2/schedule penalty gradient.
-            let _tb = std::time::Instant::now();
+            let _tb = tick();
             let mut total_grad = [0.0f64; 34];
             if hb.windowed {
                 // O(N) expanding-window grad: one pass per card, a loss at every timestep, with the
                 // groups split over the two threads (see GradShared).
-                for (a, &x) in shared.w.iter().zip(&w_vec) {
+                for (a, &x) in shared.w.iter().zip(w_vec) {
                     a.store(x.to_bits(), Ordering::Relaxed);
                 }
                 shared.batch.store(bi, Ordering::Relaxed);
                 shared.done.store(0, Ordering::Relaxed);
                 seq += 1;
                 shared.job.store((seq as u64) << 32, Ordering::Release);
-                let wc = crate::analytic::wconsts(&w_vec);
-                shared.work(seq, &w_vec, &wc, &mut caches);
+                let wc = crate::analytic::wconsts(w_vec);
+                shared.work(seq, w_vec, &wc, &mut caches);
                 let n = hb.bsz / 8;
                 while shared.done.load(Ordering::Acquire) < n {
                     std::hint::spin_loop();
@@ -1895,7 +1947,7 @@ fn train<B: AutodiffBackend>(
                 }
             } else {
                 crate::analytic::batch_loss_and_grad_simd(
-                    &w_vec, &hb.th, &hb.rh, hb.seq, hb.bsz, &hb.dts, &hb.lbl, &hb.wts, &mut total_grad,
+                    w_vec, &hb.th, &hb.rh, hb.seq, hb.bsz, &hb.dts, &hb.lbl, &hb.wts, &mut total_grad,
                 );
             }
             let mut total_grad_f32 = [0.0f32; 34];
@@ -1913,8 +1965,8 @@ fn train<B: AutodiffBackend>(
                     *v = 0.0;
                 }
             }
-            t_bwd += _tb.elapsed().as_secs_f64();
-            let _to = std::time::Instant::now();
+            t_bwd += secs(_tb);
+            let _to = tick();
             // Hand-rolled Adam — replaces burn's tensor optimizer (the last burn code in the loop;
             // it had round-tripped w through to_data().to_vec() + a fresh GradientsParams each step).
             // Element-wise replica of burn 0.17's AdaptiveMomentum: m,v start at 0; time starts at 1;
@@ -1937,8 +1989,8 @@ fn train<B: AutodiffBackend>(
                 w_host[i] -= lr_f32 * (m_hat / (v_hat.sqrt() + ADAM_EPS));
             }
             // The same clamp burn applied via parameter_clipper (clip_parameters), now in place.
-            w_host = clip_parameters(&w_host);
-            t_opt += _to.elapsed().as_secs_f64();
+            clip_parameters_in_place(&mut w_host);
+            t_opt += secs(_to);
             renderer.render_train(TrainingProgress {
                 progress,
                 epoch,
@@ -1962,7 +2014,7 @@ fn train<B: AutodiffBackend>(
             // live so the timing reflects the real validation cost; w_host is NOT touched, so the
             // trained parameters are identical whether or not validation runs.
             let mut vloss = 0.0f64;
-            for hb in &train_host {
+            for hb in train_host.iter().filter_map(|slot| slot.get()) {
                 if hb.windowed {
                     vloss += crate::analytic::card_loss_simd(
                         &w_host, &hb.th, &hb.rh, hb.seq, hb.bsz, &hb.lbl, &hb.wts,

@@ -561,6 +561,11 @@ fn clip_fsrs7_parameters(parameters: &mut [f32]) {
     parameters[26] = parameters[26].max(parameters[25]);
 }
 
+/// clip_parameters without the allocation (the per-Adam-step clip in train()).
+pub(crate) fn clip_parameters_in_place(parameters: &mut [f32]) {
+    clip_fsrs7_parameters(parameters);
+}
+
 pub(crate) fn clip_parameters(parameters: &Parameters) -> Vec<f32> {
     let mut parameters = parameters.to_vec();
     clip_fsrs7_parameters(&mut parameters);
