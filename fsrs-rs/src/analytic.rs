@@ -652,6 +652,7 @@ struct Curve8 {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 fn curve8_fwd<const FAST: bool>(
     w: &[f32], t: f32x8, s: f32x8, sf: f32x8, d: f32x8, wc: &WConsts, ln_s: f32x8, ln_sf: f32x8,
 ) -> Curve8 {
@@ -701,6 +702,7 @@ fn curve8_fwd<const FAST: bool>(
 /// VJP of curve8_fwd (the f32x8 analogue of curve_bwd; every scalar `if` is a lane blend, every
 /// gw[] += is an f32x8 accumulate). Returns (g_s, g_sf, g_d); accumulates into the f32x8 gw bank.
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 fn curve8_bwd(
     w: &[f32], c: &Curve8, t: f32x8, s: f32x8, sf: f32x8, d: f32x8, g_out: f32x8, g_r1_extra: f32x8,
     gw: &mut [f32x8; 34], wc: &WConsts,
@@ -789,6 +791,7 @@ struct Stab8 {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 fn stab8_fwd<const FAST: bool>(
     w: &[f32], last_s: f32x8, last_d: f32x8, r: f32x8, rating: f32x8, start: usize, aa: f32,
     ln_ls: f32x8, ln_ld: f32x8,
@@ -821,6 +824,7 @@ fn stab8_fwd<const FAST: bool>(
 
 /// VJP of stab8_fwd (f32x8 analogue of stab_bwd). Returns (g_last_s, g_last_d, g_r).
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 fn stab8_bwd(
     w: &[f32], c: &Stab8, last_s: f32x8, last_d: f32x8, r: f32x8, rating: f32x8, start: usize,
     g_out: f32x8, gw: &mut [f32x8; 34],
@@ -875,6 +879,7 @@ fn stab8_bwd(
 }
 
 /// f32x8 next-difficulty forward; returns (clamped out, pre-clamp out, delta_d) for the backward.
+#[inline(always)]
 fn next_d8_fwd(w: &[f32], last_d: f32x8, rating: f32x8, r: f32x8, init: f32) -> (f32x8, f32x8, f32x8) {
     let k = f32x8::splat;
     let delta_d_base = k(-w[6]) * (rating - k(3.0));
@@ -888,6 +893,7 @@ fn next_d8_fwd(w: &[f32], last_d: f32x8, rating: f32x8, r: f32x8, init: f32) -> 
 /// VJP of next_d8_fwd. Returns (g_last_d, g_r); accumulates gw[4], gw[5], gw[6]. `delta_d` is the
 /// EFFECTIVE delta_d; `r` is the curve retention (feeds the lapse surprise weighting).
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 fn next_d8_bwd(
     w: &[f32], out_pre: f32x8, delta_d: f32x8, last_d: f32x8, rating: f32x8, r: f32x8, g_out: f32x8,
     gw: &mut [f32x8; 34], exp3w5: f64,
@@ -1049,6 +1055,7 @@ impl Step8 {
 /// One recurrence step over 8 cards. `first` (t==0) initialises state from the rating exactly like
 /// batch_loss_simd; otherwise it mirrors step_fwd (curve + both stability traces + next-difficulty,
 /// then the rating==0 padding passthrough). Returns the new state and the backward cache.
+#[inline(always)]
 fn step8_fwd<const FAST: bool>(
     w: &[f32], dt_raw: f32x8, rating: f32x8, state: (f32x8, f32x8, f32x8), first: bool, wc: &WConsts,
 ) -> ((f32x8, f32x8, f32x8), Step8) {
@@ -1108,6 +1115,7 @@ fn step8_fwd<const FAST: bool>(
 /// step emits a prediction); it is added to the two stab r-adjoints before curve8_bwd, since curve.out
 /// feeds the loss AND both stability traces. The O(N^2) callers pass 0 (their loss is the separate
 /// final curve). The First variant ignores it (t==0 makes no prediction).
+#[inline(always)]
 fn step8_bwd(
     w: &[f32], c: &Step8, g_out: (f32x8, f32x8, f32x8), g_r_loss: f32x8, gw: &mut [f32x8; 34], wc: &WConsts,
 ) -> (f32x8, f32x8, f32x8) {

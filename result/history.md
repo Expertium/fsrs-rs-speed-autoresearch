@@ -34,6 +34,7 @@ Accept metric: **median per-user speed_ratio ≥ 1.05** (constraint 12) AND **sp
 | 27 | 24 | 29 | 0.852 | 10502 | 10516 | 1.001 | 1.003 | ✓ | rejected | Branchless step: compute both init and update paths, mask-select the first review |
 | 28 | 22 | 23 | 1.096 | 10502 | 10568 | 1.006 | 1.016 | ✓ | accepted | Windowed batches built from item headers: no normalize pass, regrouping, or per-item copies |
 | 29 | 21 | 17 | 1.107 | 10568 | 10601 | 1.003 | 1.008 | ✓ | accepted | Stack: per-group padding skip, free input items on thread 2, hoist weight-only curve terms |
+| 30 | 22 | 15 | 1.333 | 10601 | 10607 | 1.001 | 1.001 | ✓ | accepted | Force-inline the SIMD step, curve, stability and difficulty functions into the time loops |
 
-**Cumulative speed_ratio (product of accepted): ×136.753** — upward-biased (winner's curse); anchor periodically vs iter-0 baseline.
+**Cumulative speed_ratio (product of accepted): ×182.333** — upward-biased (winner's curse); anchor periodically vs iter-0 baseline.
 
