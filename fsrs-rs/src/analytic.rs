@@ -103,9 +103,23 @@ struct WConsts {
     aa16: f32,   // exp(w[15]-1.5)  (short stab sinc_base, start=15)
     init: f32,   // w4 - exp(3*w5) + 1   (next_d_fwd, f32)
     exp3w5: f64, // exp(3*w5) in f64      (next_d_bwd: d(init)/d(w5))
+    // Weight-only terms of the SIMD curve's second component (decay2 = -clamp(w24) is not state-
+    // modulated), computed once per call with the same f32x8 ops curve8_fwd/bwd used per step.
+    decay2: f32x8,
+    inv2: f32x8,
+    p28: f32x8,
+    factor2: f32x8,
+    m2_live: f32x8, // clamp gate of m2 = w24 (all-ones lanes where 0.01 < w24 < 0.95)
+    p28_w26: f32x8, // p28 / base2[w26]
+    nid2: f32x8,    // -1 / decay2^2
 }
 
 fn wconsts(w: &[f32]) -> WConsts {
+    let k = f32x8::splat;
+    let m2 = k(w[24]);
+    let decay2 = k(0.0) - clamp8(m2, 0.01, 0.95);
+    let inv2 = k(1.0) / decay2;
+    let p28 = exp8::<false>(inv2 * k(w[26].ln()));
     WConsts {
         ln_w27: w[25].ln(),
         ln_w28: w[26].ln(),
@@ -113,6 +127,13 @@ fn wconsts(w: &[f32]) -> WConsts {
         aa16: (w[15] - 1.5).exp(),
         init: w[4] - (w[5] * 3.0).exp() + 1.0,
         exp3w5: (w[5] as f64 * 3.0).exp(),
+        decay2,
+        inv2,
+        p28,
+        factor2: p28 - k(1.0),
+        m2_live: m2.cmp_gt(k(0.01)) & m2.cmp_lt(k(0.95)),
+        p28_w26: p28 / k(w[26]),
+        nid2: k(0.0) - k(1.0) / (decay2 * decay2),
     }
 }
 
@@ -615,13 +636,8 @@ struct Curve8 {
     q1: f32x8,
     e1: f32x8,
     p35: f32x8,
-    m2: f32x8,
-    decay2: f32x8,
-    factor2: f32x8,
     b2: f32x8,
     r2: f32x8,
-    inv2: f32x8,
-    p28: f32x8,
     ex34: f32x8,
     weight1: f32x8,
     weight2: f32x8,
@@ -637,8 +653,7 @@ struct Curve8 {
 
 #[allow(clippy::too_many_arguments)]
 fn curve8_fwd<const FAST: bool>(
-    w: &[f32], t: f32x8, s: f32x8, sf: f32x8, d: f32x8, ln_w27: f32, ln_w28: f32,
-    ln_s: f32x8, ln_sf: f32x8,
+    w: &[f32], t: f32x8, s: f32x8, sf: f32x8, d: f32x8, wc: &WConsts, ln_s: f32x8, ln_sf: f32x8,
 ) -> Curve8 {
     let sp = |i: usize| f32x8::splat(w[i]);
     let k = f32x8::splat;
@@ -653,7 +668,7 @@ fn curve8_fwd<const FAST: bool>(
     let m1 = sp(23) * p35;
     let dm1 = clamp8(m1, 0.01, 0.95);
     let decay1 = k(0.0) - dm1;
-    let q1 = k(ln_w27) / decay1;
+    let q1 = k(wc.ln_w27) / decay1;
     let e1 = exp8::<FAST>(q1.fast_min(k(60.0)));
     let factor1 = e1 - k(1.0);
     let b1 = a * factor1 + k(1.0);
@@ -662,15 +677,10 @@ fn curve8_fwd<const FAST: bool>(
     // iter-165: decay2 no longer d-modulated (m2 = w24 plain); ex34 = exp((d-5)*(d_decay-0.3))
     // is now the TIME-SCALE inside b2.
     let ex34 = exp8::<FAST>((d - k(5.0)) * (sp(32) - k(0.3)));
-    let m2 = sp(24);
-    let dm2 = clamp8(m2, 0.01, 0.95);
-    let decay2 = k(0.0) - dm2;
-    let inv2 = k(1.0) / decay2;
-    let p28 = exp8::<FAST>(inv2 * k(ln_w28));
-    let factor2 = p28 - k(1.0);
-    let b2 = bv * factor2 * ex34 + k(1.0);
+    // decay2 / p28 = base2[w26]^inv2 / factor2 are weight-only: hoisted into wc.
+    let b2 = bv * wc.factor2 * ex34 + k(1.0);
     let ln_b2 = ln8::<FAST>(b2);
-    let r2 = exp8::<FAST>(decay2 * ln_b2);
+    let r2 = exp8::<FAST>(wc.decay2 * ln_b2);
     let p31 = exp8::<FAST>(k(-w[29]) * ln_sf);
     let weight1 = sp(27) * p31;
     // se = s_long^s_weight_power2[w30] · exp((d_weight[w31]-0.5)·(d−5)) = exp(w30·ln_s +
@@ -683,8 +693,8 @@ fn curve8_fwd<const FAST: bool>(
     let ret = num / wsum;
     let out = ret * k(1.0 - 2e-5) + k(1e-5);
     Curve8 {
-        out, a, bv, m1, decay1, factor1, b1, r1, q1, e1, p35, m2, decay2, factor2, b2, r2,
-        inv2, p28, ex34, weight1, weight2, wsum, ret, p31, se, ln_sf, ln_b1, ln_b2, ln_s,
+        out, a, bv, m1, decay1, factor1, b1, r1, q1, e1, p35, b2, r2, ex34, weight1, weight2, wsum,
+        ret, p31, se, ln_sf, ln_b1, ln_b2, ln_s,
     }
 }
 
@@ -693,7 +703,7 @@ fn curve8_fwd<const FAST: bool>(
 #[allow(clippy::too_many_arguments)]
 fn curve8_bwd(
     w: &[f32], c: &Curve8, t: f32x8, s: f32x8, sf: f32x8, d: f32x8, g_out: f32x8, g_r1_extra: f32x8,
-    gw: &mut [f32x8; 34], ln_w27: f32, ln_w28: f32,
+    gw: &mut [f32x8; 34], wc: &WConsts,
 ) -> (f32x8, f32x8, f32x8) {
     let sp = |i: usize| f32x8::splat(w[i]);
     let k = f32x8::splat;
@@ -721,19 +731,19 @@ fn curve8_bwd(
     gw[29] += g_p31 * (z - c.p31 * c.ln_sf);
     // r2 = b2^decay2 ; iter-165: b2 = bv*factor2*ex34 + 1 (ex34 = D time-scale) and
     // decay2 = -clamp(w24) is no longer d-modulated.
-    let g_b2 = g_r2 * c.decay2 * (c.r2 / c.b2);
+    let g_b2 = g_r2 * wc.decay2 * (c.r2 / c.b2);
     let mut g_decay2 = g_r2 * c.r2 * c.ln_b2;
-    let g_bv = g_b2 * c.factor2 * c.ex34;
+    let g_bv = g_b2 * wc.factor2 * c.ex34;
     let g_factor2 = g_b2 * c.bv * c.ex34;
-    let g_ex34 = g_b2 * c.bv * c.factor2;
+    let g_ex34 = g_b2 * c.bv * wc.factor2;
     g_d += g_ex34 * c.ex34 * (sp(32) - k(0.3)); // ex34 = exp((d-5)*(d_decay-0.3))
     gw[32] += g_ex34 * c.ex34 * (d - k(5.0));
     let g_p28 = g_factor2;
-    gw[26] += g_p28 * c.inv2 * (c.p28 / sp(26)); // p28 = base2[w26]^inv2
-    let g_inv2 = g_p28 * c.p28 * k(ln_w28);
-    g_decay2 += g_inv2 * (z - k(1.0) / (c.decay2 * c.decay2));
+    gw[26] += g_p28 * wc.inv2 * wc.p28_w26; // p28 = base2[w26]^inv2
+    let g_inv2 = g_p28 * wc.p28 * k(wc.ln_w28);
+    g_decay2 += g_inv2 * wc.nid2;
     let g_dm2 = z - g_decay2;
-    let g_m2 = (c.m2.cmp_gt(k(0.01)) & c.m2.cmp_lt(k(0.95))).blend(g_dm2, z);
+    let g_m2 = wc.m2_live.blend(g_dm2, z);
     gw[24] += g_m2; // m2 = w24 directly (clamp gate via c.m2)
     g_s += g_bv * (z - t / (s * s)); // bv = t/s
     // r1 = b1^decay1
@@ -746,7 +756,7 @@ fn curve8_bwd(
     let g_q1 = c.q1.cmp_lt(k(60.0)).blend(g_q1c, z);
     // q1 = ln(base1) / decay1
     let g_lw27 = g_q1 / c.decay1;
-    g_decay1 += g_q1 * (z - k(ln_w27) / (c.decay1 * c.decay1));
+    g_decay1 += g_q1 * (z - k(wc.ln_w27) / (c.decay1 * c.decay1));
     gw[25] += g_lw27 / sp(25); // ln_base1 = ln(w[25])
     let g_dm1 = z - g_decay1;
     let g_m1 = (c.m1.cmp_gt(k(0.01)) & c.m1.cmp_lt(k(0.95))).blend(g_dm1, z);
@@ -945,7 +955,7 @@ pub(crate) fn batch_loss_simd(
                 let ln_s = ln8::<false>(s_c);
                 let ln_sf = ln8::<false>(sf_c);
                 let ln_d = ln8::<false>(d_c);
-                let curve = curve8_fwd::<false>(w, dt, s_c, sf_c, d_c, wc.ln_w27, wc.ln_w28, ln_s, ln_sf);
+                let curve = curve8_fwd::<false>(w, dt, s_c, sf_c, d_c, &wc, ln_s, ln_sf);
                 let rr = curve.out;
                 let ns = stab8_fwd::<false>(w, s_c, d_c, rr, rating, 7, wc.aa7, ln_s, ln_d).out;
                 let nsf_raw = stab8_fwd::<false>(w, sf_c, d_c, curve.r1, rating, 15, wc.aa16, ln_sf, ln_d).out;
@@ -961,7 +971,7 @@ pub(crate) fn batch_loss_simd(
         }
         let dts = load8(delta_ts, c0);
         let r = clamp8(
-            curve8_fwd::<false>(w, dts, s, sf, d, wc.ln_w27, wc.ln_w28, ln8::<false>(s), ln8::<false>(sf)).out,
+            curve8_fwd::<false>(w, dts, s, sf, d, &wc, ln8::<false>(s), ln8::<false>(sf)).out,
             MIN_R,
             MAX_R,
         );
@@ -1068,7 +1078,7 @@ fn step8_fwd<const FAST: bool>(
         let ln_last_s = ln8::<FAST>(last_s);
         let ln_last_sf = ln8::<FAST>(last_sf);
         let ln_last_d = ln8::<FAST>(last_d);
-        let curve = curve8_fwd::<FAST>(w, dt, last_s, last_sf, last_d, wc.ln_w27, wc.ln_w28, ln_last_s, ln_last_sf);
+        let curve = curve8_fwd::<FAST>(w, dt, last_s, last_sf, last_d, wc, ln_last_s, ln_last_sf);
         let r = curve.out;
         let r1 = curve.r1; // short component recall — drives the short-trace update (iter-71)
         let slow = stab8_fwd::<FAST>(w, last_s, last_d, r, rating, 7, wc.aa7, ln_last_s, ln_last_d);
@@ -1153,7 +1163,7 @@ fn step8_bwd(
             // curve.out adjoint = long-stab r + windowed loss adjoint + next_d r; curve.r1 = short-stab r.
             let (g_ls_d, g_lsf_d, g_ld_d) = curve8_bwd(
                 w, curve, *dt, *last_s, *last_sf, *last_d, g_r_long + g_r_loss + g_r_nextd, g_r1_short,
-                gw, wc.ln_w27, wc.ln_w28,
+                gw, wc,
             );
             let g_last_s = g_ls_a + g_ls_d + g_last_s_extra;
             let g_last_sf = g_lsf_b + g_lsf_d + g_last_sf_extra;
@@ -1213,7 +1223,7 @@ fn loss_and_grad_range_simd(
         let wt = load8(weights, c0);
         let ln_s = ln8::<false>(s);
         let ln_sf = ln8::<false>(sf);
-        let fc = curve8_fwd::<false>(w, dts, s, sf, d, wc.ln_w27, wc.ln_w28, ln_s, ln_sf);
+        let fc = curve8_fwd::<false>(w, dts, s, sf, d, &wc, ln_s, ln_sf);
         let r_raw = fc.out;
         let r = clamp8(r_raw, MIN_R, MAX_R);
         // (loss VALUE skipped — see the fn doc; training discards it, validation uses batch_loss_simd.)
@@ -1222,7 +1232,7 @@ fn loss_and_grad_range_simd(
         let g_rraw = (r_raw.cmp_gt(k(MIN_R)) & r_raw.cmp_lt(k(MAX_R))).blend(g_r, k(0.0));
         let mut gw_g = [f32x8::splat(0.0); 34];
         let (mut g_s, mut g_sf, mut g_d) =
-            curve8_bwd(w, &fc, dts, s, sf, d, g_rraw, f32x8::splat(0.0), &mut gw_g, wc.ln_w27, wc.ln_w28);
+            curve8_bwd(w, &fc, dts, s, sf, d, g_rraw, f32x8::splat(0.0), &mut gw_g, &wc);
         for t in (0..sl).rev() {
             // O(N^2) path: the only loss is the final curve (handled above), so no per-step adjoint.
             let (gs0, gd0, gsf0) =
@@ -1305,6 +1315,13 @@ pub(crate) fn card_loss_and_grad_simd(
     for g in 0..n_groups {
         let c0 = g * 8;
         caches.clear();
+        // This group's own length: trailing timesteps where all 8 lanes are padding (rating 0; real
+        // ratings are >= 1) carry weight 0 and only pass the state through, so they add exactly 0
+        // to the gradient — skip them (bit-for-bit). Min 2 = the shortest card.
+        let mut seq_len = seq_len;
+        while seq_len > 2 && load8(r_hist, (seq_len - 1) * batch + c0).reduce_add() == 0.0 {
+            seq_len -= 1;
+        }
         let (mut s, mut d, mut sf) = (z, z, z);
         // Forward over every step EXCEPT the last (full step + cache). The last step's stability/
         // next-difficulty update feeds no t+1, so we compute its curve only (just below) — exactly
@@ -1326,7 +1343,7 @@ pub(crate) fn card_loss_and_grad_simd(
         let (ls, lsf, ld) =
             (clamp8(s, S_MIN, S_MAX), clamp8(sf, S_MIN, S_MAX), clamp8(d, D_MIN, D_MAX));
         let fc_last = curve8_fwd::<false>(
-            w, dt_last, ls, lsf, ld, wc.ln_w27, wc.ln_w28, ln8::<false>(ls), ln8::<false>(lsf),
+            w, dt_last, ls, lsf, ld, &wc, ln8::<false>(ls), ln8::<false>(lsf),
         );
         // Reverse pass. The final state's adjoint is 0, so at the last step the stab/next_d backward
         // all multiply 0 -> only curve8_bwd(loss-adjoint) contributes. BIT-FOR-BIT identical to a full
@@ -1334,7 +1351,7 @@ pub(crate) fn card_loss_and_grad_simd(
         let mut gw_g = [f32x8::splat(0.0); 34];
         let g_rraw_last = g_r_loss_at(fc_last.out, lbase);
         let (g_ls, g_lsf, g_ld) = curve8_bwd(
-            w, &fc_last, dt_last, ls, lsf, ld, g_rraw_last, f32x8::splat(0.0), &mut gw_g, wc.ln_w27, wc.ln_w28,
+            w, &fc_last, dt_last, ls, lsf, ld, g_rraw_last, f32x8::splat(0.0), &mut gw_g, &wc,
         );
         let mut g_s = (s.cmp_gt(k(S_MIN)) & s.cmp_lt(k(S_MAX))).blend(g_ls, z);
         let mut g_d = (d.cmp_gt(k(D_MIN)) & d.cmp_lt(k(D_MAX))).blend(g_ld, z);
@@ -1387,7 +1404,7 @@ pub(crate) fn card_loss_simd(
                     (clamp8(s, S_MIN, S_MAX), clamp8(sf, S_MIN, S_MAX), clamp8(d, D_MIN, D_MAX));
                 clamp8(
                     curve8_fwd::<false>(
-                        w, dt.fast_max(z), ls, lsf, ld, wc.ln_w27, wc.ln_w28,
+                        w, dt.fast_max(z), ls, lsf, ld, &wc,
                         ln8::<false>(ls), ln8::<false>(lsf),
                     )
                     .out,

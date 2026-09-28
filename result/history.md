@@ -33,6 +33,7 @@ Accept metric: **median per-user speed_ratio ≥ 1.05** (constraint 12) AND **sp
 | 26 | 27 | 26 | 1.041 | 7257 | 7285 | 1.004 | 1.010 | ✓ | rejected | Per-group padding skip: each group runs only to its longest card, not the batch-wide seq_len |
 | 27 | 24 | 29 | 0.852 | 10502 | 10516 | 1.001 | 1.003 | ✓ | rejected | Branchless step: compute both init and update paths, mask-select the first review |
 | 28 | 22 | 23 | 1.096 | 10502 | 10568 | 1.006 | 1.016 | ✓ | accepted | Windowed batches built from item headers: no normalize pass, regrouping, or per-item copies |
+| 29 | 21 | 17 | 1.107 | 10568 | 10601 | 1.003 | 1.008 | ✓ | accepted | Stack: per-group padding skip, free input items on thread 2, hoist weight-only curve terms |
 
-**Cumulative speed_ratio (product of accepted): ×123.535** — upward-biased (winner's curse); anchor periodically vs iter-0 baseline.
+**Cumulative speed_ratio (product of accepted): ×136.753** — upward-biased (winner's curse); anchor periodically vs iter-0 baseline.
 

@@ -1343,13 +1343,20 @@ pub fn compute_parameters(
     if let Some(lr) = std::env::var("FSRS_LR").ok().and_then(|s| s.trim().parse().ok()) {
         config.learning_rate = lr;
     }
-    let (train_host, total_size) = match &train_card_ids {
-        Some(train_card_ids) => build_host_batches_carded(
-            &train_set,
-            train_card_ids,
-            config.batch_size,
-            config.max_seq_len,
-        ),
+    // The windowed path frees the prefix-items (one heap block each, ~10% of a large user's time)
+    // on the second thread (constraint 2) while this one trains; joined before returning.
+    let mut dropper = None;
+    let (train_host, total_size) = match train_card_ids {
+        Some(train_card_ids) => {
+            let host = build_host_batches_carded(
+                &train_set,
+                &train_card_ids,
+                config.batch_size,
+                config.max_seq_len,
+            );
+            dropper = Some(std::thread::spawn(move || drop((train_set, train_card_ids))));
+            host
+        }
         None => {
             let mut weighted_train_set = recency_weighted_fsrs_items_tuned(train_set);
             weighted_train_set.retain(|item| item.item.reviews.len() <= config.max_seq_len);
@@ -1375,6 +1382,9 @@ pub fn compute_parameters(
         progress.clone().map(|p| ProgressCollector::new(p, 0)),
     );
 
+    if let Some(dropper) = dropper {
+        dropper.join().unwrap();
+    }
     let optimized_parameters = model
         .inspect_err(|_e| {
             finish_progress();
