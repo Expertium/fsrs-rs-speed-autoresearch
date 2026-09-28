@@ -48,7 +48,17 @@ start /high /affinity 0xFFFFFFF0 python compute_parameters.py --algo FSRS-rs --s
   powercfg /setactive SCHEME_CURRENT
   ```
 
-## Measuring a candidate (the `.pyd`-swap recipe — read this before timing)
+## Measuring a candidate — OFFICIAL from iter34: the PAIRED protocol (Andrew 2026-09-28)
+
+**`python profiling/measure_paired.py <champion.pyd> <candidate.pyd> [out.json]`** is the official timing for every iteration from iter34 on. It prints `speed_ratio` (median of per-user t_champion / t_candidate), `mean_speedup`, `param_hash_diffs` (0 = bit-for-bit), both mean LogLosses and `logloss_in_band` (the 3b bar). ~12 s per run.
+- **Why (Andrew's idea):** the champion and the candidate run the SAME user AT THE SAME TIME, so background load that changes over time (other projects' jobs, thermal drift) hits both equally and cancels in the ratio. The old back-to-back runs were ~5 minutes apart and absorbed the load difference.
+- **Design:** 5 pair slots × 2 binaries = 10 worker processes of 2 logical CPUs each (same total load as `--processes 10`), off CPUs 0-3, HIGH priority. A slot takes the next user (largest first) and runs it 3 times on both binaries at once; the next user starts only when both finish (so the faster binary never leaves the slower one a quieter machine). Between reps the two binaries swap CPU blocks AND start order (a fixed start order leaned ~0.3% toward the first). Per-user time = min of 3. Each binary is loaded from its own temp copy of the `.pyd`, so no `.pyd` swap into `target/` is needed.
+- **Timed region:** the same Rust `compute_parameters()` call with the same input, fed through the bit-for-bit `compute_parameters_raw` twin from cached arrays (`profiling/devbench/raw50.pkl`; regenerate with `python profiling/devbench/cache_raw.py`, which asserts nothing — check `sum(size)` if the dataset changes). Untimed afterwards: each user's LogLoss under the frozen `evaluate()` (`evaluate_raw`).
+- **Validation (2026-09-28, with a ~7-core RWKV job loading the box):** A/A ×10 (champion vs itself) medians 0.9952–1.0075 (worst 0.75%), no side favoured; the old protocol showed ~±5% under the same load. A real difference (iter30 → iter33) read ×1.114/1.111/1.115/1.116. LogLoss 0.308320 = the official harness exactly.
+- Snapshot every candidate `.pyd` (e.g. `cp …/target/release/fsrs_rs_python.cp312-win_amd64.pyd <scratch>/candN.pyd`) and keep the champion's snapshot current on every accept.
+- The old back-to-back `.pyd`-swap recipe below remains for reference and for anything the paired script does not cover (it is how iters 0–33 were timed).
+
+## (Legacy, iters 0–33) Measuring a candidate: the `.pyd`-swap recipe
 
 `profiling/measure.py` drives every timing run. "Back-to-back in the same session" means **swap pre-built `.pyd` files**, NOT rebuild the champion from git twice (slow, and the swap is byte-exact). Python imports `fsrs_rs_python/target/release/fsrs_rs_python.cp312-win_amd64.pyd` (release `""` is tried before `deps/` before `debug/` — `fsrs_rs_python/__init__.py` loads the first hit), so **that one file decides which binary runs.**
 
@@ -108,9 +118,9 @@ Build artifacts (`*/target/`, `__pycache__/`) and the external dataset (`../anki
 ## Measurement protocol (how every timing number is produced)
 
 - Time each of the 50 users 3 times; the official per-user time is the **MIN** of the 3. Timing noise is one-sided (interference only ever slows a run), so the fastest of the three is the cleanest estimate of the true compute floor, and it also rejects the cold first run. (Empirically, min ~halves per-user run-to-run noise vs. the median, for free.)
-- Always time under `--processes 10` (parallel across users).
+- Always time under `--processes 10` (parallel across users). (Paired protocol from iter34: 10 workers in total = 5 per binary; see "Measuring a candidate".)
 - **Timed region = `compute_parameters()` (Rust) only**: exclude data loading / I/O and the `evaluate()` call; use a monotonic clock. Python stays untimed.
-- Time the champion and the candidate **back-to-back in the same session** (re-baseline every comparison). Never reuse a baseline from an earlier session — the machine drifts (thermal/turbo/background load) over a 150–300 iteration campaign.
+- Time the champion and the candidate **in the same session** — from iter34 **simultaneously, paired per user** (`profiling/measure_paired.py`); iters 0–33 ran them back-to-back (re-baseline every comparison). Never reuse a baseline from an earlier session — the machine drifts (thermal/turbo/background load) over a 150–300 iteration campaign.
 - **Noise floor (measured: 3×10 identical-build runs, 2026-06-01).** Run-to-run noise is ~**1%**, *not* the ~0.35–0.5% earlier *single* back-to-back pairs implied (those were lucky-tight draws). Across 10 identical runs the median-over-50 time has CV ≈ **0.95–1.1%**; the accept metric itself — the median per-user speedup between two runs (constraint 12) — lands within **~0.7%** of 1.0 typically and up to **~2%** in the worst of 45 pairs. So the 5% bar clears *typical* noise ~7× but **worst-case paired noise only ~2.5×** — discount sub-~2% median "speedups" as likely noise. (The median does **not** average out per-user noise — it's one order statistic, not a mean — so its CV ≈ the ~1.2% per-user CV; the median is used for robustness to the big collections, not variance reduction.)
 - **What the guards buy (same experiment).** Priority+affinity and big-first did **not** measurably change the noise floor — run-to-run CV was ~1.0% / 1.1% / 0.95% for no-guards / +prio+affinity / +big-first (indistinguishable at n=10), plausibly because min-of-3 already discards contention-driven slow runs. Their real payoff is elsewhere: CPU-pinning lowered the median compute *level* ~**2.6%** (less core-migration/cache thrash) and big-first cut *wall-clock* ~**10%**. Keep them for a lower/faster/steadier floor — just don't expect them to tighten run-to-run variance.
 - **Per-user `.jsonl` record structure** (one JSON object per line in `result/compute_parameters-*.jsonl` and its `profiling/measure/<label>.jsonl` snapshots; one line per user, re-sorted by `user`):
