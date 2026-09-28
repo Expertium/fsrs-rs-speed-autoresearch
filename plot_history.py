@@ -2,8 +2,9 @@
 """
 Visualize the FSRS-rs speed autoresearch iteration history.
 
-Reads ``result/history.jsonl`` and draws TWO stacked views vs iteration
-(-> ``result/history_plot.png``):
+Reads ``result/history.jsonl`` and draws TWO stacked views vs iteration, twice: linear y axes
+(-> ``result/history_plot.png``) and logarithmic y axes (-> ``result/history_plot_log.png``,
+the ``--out`` name with a ``_log`` suffix):
 
 1. Cumulative speedup — the running product of the *accepted* iterations' median
    ``speed_ratio`` (the accept metric, constraint 12, compounded). This is the
@@ -24,7 +25,7 @@ Expected per-row fields: ``iteration``, ``status`` ("accepted"/"rejected"),
 champion; 1.0 for the iter-0 baseline), and ``time_after`` (the candidate's
 median per-user time, ms).
 
-    python plot_history.py                       # -> result/history_plot.png
+    python plot_history.py                       # -> result/history_plot.png + history_plot_log.png
     python plot_history.py --no-summaries
     python plot_history.py --history alt.jsonl --out alt.png
     python plot_history.py --benchmark           # Phase-2 benchmark() history
@@ -159,6 +160,13 @@ def main() -> None:
     if not champs:
         raise SystemExit("no champion records to plot")
 
+    log_out = args.out.with_name(f"{args.out.stem}_log{args.out.suffix}")
+    for log, out in ((False, args.out), (True, log_out)):
+        draw(args, rows, champs, rejects, log, out)
+
+
+def draw(args, rows, champs, rejects, log: bool, out: Path) -> None:
+    """One two-panel figure; `log` puts both y axes on a log scale."""
     xs = [r["iteration"] for r in rows]
     xmin, xmax = min(xs), max(xs)
     xspan = max(1, xmax - xmin)
@@ -235,11 +243,18 @@ def main() -> None:
     ax_sp.grid(True, alpha=0.25)
     ax_sp.legend(loc="upper right", framealpha=0.9)
 
+    all_y = cy + [1.0] + [p[1] for p in reject_pts]
     ylo, yhi = min(cy + [1.0]), max(cy + [1.0])
-    yr = (yhi - ylo) or 1.0
     # Room above the highest point so its label stays clear of the upper-right legend.
-    pad_top = (0.35 if not args.no_summaries else 0.25) * yr
-    ax_sp.set_ylim(ylo - 0.05 * yr - 0.01, yhi + pad_top + 0.01)
+    pad_top = 0.35 if not args.no_summaries else 0.25
+    if log:
+        ax_sp.set_yscale("log")
+        lo, hi = math.log10(min(all_y)), math.log10(yhi)
+        lr = (hi - lo) or 1.0
+        ax_sp.set_ylim(10 ** (lo - 0.05 * lr), 10 ** (hi + pad_top * lr))
+    else:
+        yr = (yhi - ylo) or 1.0
+        ax_sp.set_ylim(ylo - 0.05 * yr - 0.01, yhi + pad_top * yr + 0.01)
 
     # ---- Bottom panel: median time (machine-specific; NOT the accept metric) ----
     ty = [r["time_after"] for r in rows]
@@ -268,7 +283,13 @@ def main() -> None:
     )
     ax_t.grid(True, alpha=0.25)
     ax_t.legend(loc="upper right", framealpha=0.9)
-    ax_t.set_ylim(0, tmax + 0.10 * tr)
+    if log:
+        ax_t.set_yscale("log")
+        lo, hi = math.log10(tmin), math.log10(tmax)
+        lr = (hi - lo) or 1.0
+        ax_t.set_ylim(10 ** (lo - 0.08 * lr), 10 ** (hi + 0.10 * lr))
+    else:
+        ax_t.set_ylim(0, tmax + 0.10 * tr)
 
     max_iter = max(xs)
     x_step = nice_tick_step(max_iter)
@@ -277,10 +298,11 @@ def main() -> None:
     ax_t.set_xlim(xmin - xpad_lo, xmax + xpad_hi)
 
     fig.tight_layout(rect=(0.03, 0.03, 0.98, 0.95))
-    fig.savefig(args.out, dpi=130, bbox_inches="tight", pad_inches=0.25)
+    fig.savefig(out, dpi=130, bbox_inches="tight", pad_inches=0.25)
+    plt.close(fig)
 
     print(
-        f"wrote {args.out}  ({len(champs)} champions, {len(rejects)} rejected, "
+        f"wrote {out}  ({len(champs)} champions, {len(rejects)} rejected, "
         f"latest iter {xmax}, cumulative ×{cy[-1]:.1f})"
     )
 

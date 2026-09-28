@@ -4,6 +4,8 @@ An **autoresearch loop** that made [FSRS-rs](https://github.com/open-spaced-repe
 
 [![Campaign progress: cumulative median speedup (top) and median per-user optimizer time (bottom) vs iteration](result/history_plot.png)](result/history_plot.png)
 
+[![The same two panels with logarithmic y axes](result/history_plot_log.png)](result/history_plot_log.png)
+
 *Each point is an accepted change: the agent measures a candidate against the current champion and keeps it only if the typical (median) user's optimization gets faster with minor loss of accuracy. The top panel is the compounding median speedup vs the original baseline; see [**Tracking progress**](#tracking-progress) for how to read it.*
 
 > **🤖 Working on this repo (human or AI)? Read [`CLAUDE.md`](CLAUDE.md) first.**
@@ -86,7 +88,7 @@ Run `uv run benchmark.py --help` for the full list.
 
 ## Tracking progress
 
-`plot_history.py` reads `result/history.jsonl` and renders two stacked views vs iteration to `result/history_plot.png`:
+`plot_history.py` reads `result/history.jsonl` and renders two stacked views vs iteration to `result/history_plot.png` (linear y axes) and `result/history_plot_log.png` (the same panels with logarithmic y axes):
 
 ```bash
 uv run plot_history.py
