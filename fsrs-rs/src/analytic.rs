@@ -58,16 +58,26 @@ fn exp8<const FAST: bool>(x: f32x8) -> f32x8 {
 /// round() did, without round()'s and round_int()'s NaN/overflow fix-ups (~10 ops/half on SSE2).
 #[inline(always)]
 fn exp8_in_range<const FAST: bool>(x: f32x8) -> f32x8 {
-    let ni = (x * f32x8::splat(LOG2E)).fast_round_int();
+    exp2_8_in_range::<FAST>(x * f32x8::splat(LOG2E))
+}
+
+/// 2^y over 8 lanes (= exp8_in_range(y * ln2)); |y| <= ~126. Callers whose exp argument is a
+/// constant times a variable fold log2(e) into the constant (WConsts::l2e) and call this directly.
+#[inline(always)]
+fn exp2_8_in_range<const FAST: bool>(y: f32x8) -> f32x8 {
+    let ni = y.fast_round_int();
     let n = ni.round_float();
-    let r = x - n * f32x8::splat(LN2);
     let c = |v: f32| f32x8::splat(v);
     let p = if FAST {
         // degree-2 RELATIVE-minimax of exp(r) over [-ln2/2, ln2/2]; max rel err 1.7e-3.
+        let r = (y - n) * f32x8::splat(LN2);
         c(1.00044314196) + r * (c(1.01486094962) + r * c(0.496258591073))
     } else {
-        // degree-3 RELATIVE-minimax (Remez); max rel err 7.5e-5 (profiling/minimax_coeffs.py).
-        c(0.999928073539) + r * (c(1.00016418577) + r * (c(0.50496326418) + r * c(0.165668423429)))
+        // The degree-3 RELATIVE-minimax of exp(r) over [-ln2/2, ln2/2] (Remez; max rel err 7.5e-5,
+        // profiling/minimax_coeffs.py), written as a polynomial in f = y - n = r / ln2 (so 2^f):
+        // coefficient k times ln2^k. The same approximation, one multiply (n * ln2) less.
+        let f = y - n;
+        c(0.999928073539) + f * (c(0.6932609854635089) + f * (c(0.24261112219325395) + f * c(0.055171669057997336)))
     };
     let bits: i32x8 = (ni + i32x8::splat(127)) << 23;
     let two_n: f32x8 = bytemuck::cast(bits);
@@ -103,6 +113,23 @@ fn ln8<const FAST: bool>(x: f32x8) -> f32x8 {
     e_f * f32x8::splat(LN2) + poly
 }
 
+/// log2 over 8 lanes: ln8's approximation divided by ln2 (the poly's leading constant scaled
+/// by log2(e)), without ln8's e * ln2 multiply. The recurrence keeps its logs in base 2: they only
+/// feed 2^x (exp2_8_in_range) and weight gradients (finish_gw applies the ln2 once per group).
+#[inline(always)]
+fn log2_8(x: f32x8) -> f32x8 {
+    let bits: i32x8 = bytemuck::cast(x);
+    let e: i32x8 = (bits >> 23) - i32x8::splat(127);
+    let mant_bits: i32x8 = (bits & i32x8::splat(0x007f_ffff)) | i32x8::splat(127 << 23);
+    let m: f32x8 = bytemuck::cast(mant_bits);
+    let one = f32x8::splat(1.0);
+    let t = (m - one) / (m + one);
+    let t2 = t * t;
+    let c = |v: f32| f32x8::splat(v);
+    let poly = c(2.0 * LOG2E) * t * (c(1.0000073389) + t2 * (c(0.332179529507) + t2 * c(0.226577770996)));
+    e.round_float() + poly
+}
+
 /// Loop-invariant (weight-only) subexpressions, computed ONCE per batch_loss[_and_grad] call
 /// instead of once per (card × timestep). Identical ops to the old inline versions (same f32/f64),
 /// so it's BIT-FOR-BIT — it just lifts redundant transcendentals out of the hot per-timestep
@@ -121,13 +148,17 @@ pub(crate) struct WConsts {
     // modulated), computed once per call with the same f32x8 ops curve8_fwd/bwd used per step.
     decay2: f32x8,
     factor2: f32x8, // p28 - 1, p28 = base2[w26]^(1/decay2)
-    ln_w28_w27: f32, // ln(base_weight2[w28] / base_weight1[w27]): the constant term of the mix logit
     nrw27: f32,      // -1 / w27 = d(logit)/d(w27)
     rw28: f32,       // 1 / w28 = d(logit)/d(w28)
     rw25: f32,       // 1 / w25 = d(ln base1)/d(w25)
     k26: f32,        // (d(p28)/d(w26)) / factor2 = (p28 / (decay2 * w26)) / factor2
     k24: f32,        // (d(p28)/d(w24)) / factor2 = -(p28 * ln(w26) * (-1/decay2^2)) / factor2
     live24: bool,    // 0.01 < w24 < 0.95 (decay2's clamp is inactive)
+    // Exponent constants pre-multiplied by log2(e), for exp2_8_in_range.
+    l2e: [f32; 34],   // w[i] * log2(e)
+    w32m_l: f32,      // (w32 - 0.3) * log2(e)
+    w31m_l: f32,      // (w31 - 0.5) * log2(e)
+    lz0_l: f32,       // ln(w28 / w27) * log2(e)
 }
 
 pub(crate) fn wconsts(w: &[f32]) -> WConsts {
@@ -146,13 +177,16 @@ pub(crate) fn wconsts(w: &[f32]) -> WConsts {
         exp3w5: (w[5] as f64 * 3.0).exp(),
         decay2,
         factor2,
-        ln_w28_w27: (w[28] / w[27]).ln(),
         nrw27: -1.0 / w[27],
         rw28: 1.0 / w[28],
         rw25: 1.0 / w[25],
         k26: (inv2 * (p28 / k(w[26])) / factor2).to_array()[0],
         k24: (p28 * k(w[26].ln()) * (k(0.0) - k(1.0) / (decay2 * decay2)) / factor2).to_array()[0],
         live24: w[24] > 0.01 && w[24] < 0.95,
+        l2e: std::array::from_fn(|i| w[i] * LOG2E),
+        w32m_l: (w[32] - 0.3) * LOG2E,
+        w31m_l: (w[31] - 0.5) * LOG2E,
+        lz0_l: (w[28] / w[27]).ln() * LOG2E,
     }
 }
 
@@ -677,7 +711,7 @@ fn curve8_fwd<const FAST: bool>(
     // ex34=exp((d-5)*(d_decay[w32]-0.3)), m2=decay2[w24]*ex34, p28=base2[w26]^inv2,
     // p31=s_short^-s_weight_power1[w29], weight1=base_weight1[w27]*p31. ln_w27=ln(base1=w25),
     // ln_w28=ln(base2=w26).
-    let p35 = exp8_in_range::<FAST>((sp(33) - k(0.3)) * ln_sf);
+    let p35 = exp2_8_in_range::<FAST>((sp(33) - k(0.3)) * ln_sf); // ln_sf, ln_s are log2
     let m1 = sp(23) * p35;
     let dm1 = clamp8(m1, 0.01, 0.95);
     let decay1 = k(0.0) - dm1;
@@ -685,23 +719,23 @@ fn curve8_fwd<const FAST: bool>(
     let e1 = exp8_in_range::<FAST>(q1.fast_min(k(60.0)));
     let factor1 = e1 - k(1.0);
     let b1 = a * factor1 + k(1.0);
-    let ln_b1 = ln8::<FAST>(b1);
-    let r1 = exp8_in_range::<FAST>(decay1 * ln_b1);
+    let ln_b1 = log2_8(b1);
+    let r1 = exp2_8_in_range::<FAST>(decay1 * ln_b1);
     // iter-165: decay2 no longer d-modulated (m2 = w24 plain); ex34 = exp((d-5)*(d_decay-0.3))
     // is now the TIME-SCALE inside b2.
-    let ex34 = exp8_in_range::<FAST>((d - k(5.0)) * (sp(32) - k(0.3)));
+    let ex34 = exp2_8_in_range::<FAST>((d - k(5.0)) * k(wc.w32m_l));
     // decay2 / p28 = base2[w26]^inv2 / factor2 are weight-only: hoisted into wc.
     let q2 = bv * wc.factor2 * ex34;
     let b2 = q2 + k(1.0);
-    let ln_b2 = ln8::<FAST>(b2);
-    let r2 = exp8_in_range::<FAST>(wc.decay2 * ln_b2);
+    let ln_b2 = log2_8(b2);
+    let r2 = exp2_8_in_range::<FAST>(wc.decay2 * ln_b2);
     // ret = (weight1*r1 + weight2*r2) / (weight1 + weight2), weight1 = base_weight1[w27] *
     // sf^-s_weight_power1[w29], weight2 = base_weight2[w28] * s^s_weight_power2[w30] *
     // exp((d_weight[w31]-0.5)(d-5)). Written as r1*(1-sig) + r2*sig with sig = sigmoid(z) and
     // z = ln(weight2/weight1): the same function with ONE exp instead of two (3b reassociation).
     // |z| <= ln(100) + 1.1*ln(36500) + 2.5 + 0.9*ln(36500) < 29, inside exp8's range.
-    let z = k(wc.ln_w28_w27) + sp(30) * ln_s + (d - k(5.0)) * (sp(31) - k(0.5)) + sp(29) * ln_sf;
-    let ez = exp8_in_range::<FAST>(z);
+    let zl = k(wc.lz0_l) + sp(30) * ln_s + (d - k(5.0)) * k(wc.w31m_l) + sp(29) * ln_sf;
+    let ez = exp2_8_in_range::<FAST>(zl); // zl = z * log2(e)
     let oms = k(1.0) / (ez + k(1.0)); // 1 - sig
     let sig = ez * oms;
     let ret = r1 * oms + r2 * sig;
@@ -754,7 +788,7 @@ fn curve8_bwd(
     // r1 = b1^decay1, b1 = a*factor1 + 1, a = t/sf, factor1 = e1 - 1, e1 = exp(min(q1, 60)),
     // q1 = ln(base1[w25]) / decay1, decay1 = -clamp(w23 * p35), p35 = sf^(s_decay1[w33]-0.3).
     let v1 = g_r1 * c.r1; // adjoint of ln(r1) = decay1 * ln(b1)
-    let mut g_decay1 = v1 * c.ln_b1;
+    let mut g_decay1 = v1 * c.ln_b1 * k(LN2); // ln(b1) = log2(b1) * ln2
     let g_b1_a = v1 * decay1 / b1 * c.a; // adjoint of b1, times a
     let g_a_a = g_b1_a * factor1; // adjoint of ln(a)
     let g_q1 = c.q1.cmp_lt(k(60.0)).blend(g_b1_a * c.e1, z);
@@ -799,7 +833,7 @@ struct Stab8 {
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn stab8_fwd<const FAST: bool>(
-    w: &[f32], last_s: f32x8, last_d: f32x8, r: f32x8, rating: f32x8, start: usize, aa: f32,
+    w: &[f32], wc: &WConsts, last_s: f32x8, last_d: f32x8, r: f32x8, rating: f32x8, start: usize, aa: f32,
     ln_ls: f32x8,
 ) -> Stab8 {
     let sp = |i: usize| f32x8::splat(w[i]);
@@ -807,8 +841,8 @@ fn stab8_fwd<const FAST: bool>(
     let one = k(1.0);
     let he = hard_easy8(w, rating, start);
     let bb = k(11.0) - last_d;
-    let cc = exp8_in_range::<FAST>(k(-w[start + 1]) * ln_ls);
-    let expr = exp8_in_range::<FAST>((one - r) * sp(start + 2));
+    let cc = exp2_8_in_range::<FAST>(k(-w[start + 1]) * ln_ls);
+    let expr = exp2_8_in_range::<FAST>((one - r) * k(wc.l2e[start + 2]));
     let aa8 = k(aa);
     let sinc = aa8 * bb * cc * (expr - one) * he + one;
     let ls_sinc = last_s * sinc;
@@ -821,11 +855,11 @@ fn stab8_fwd<const FAST: bool>(
         let z = k(0.0);
         return Stab8 { out: ls_sinc, nsf_fail: z, sinc, cc, expr, pr: z, qbase: z, ln_ls1: z, full };
     }
-    let ln_ls1 = ln8::<FAST>(last_s + one);
-    let qbase = exp8_in_range::<FAST>(sp(start + 4) * ln_ls1); // (last_s+1)^fail_s_exp[start+4]
+    let ln_ls1 = log2_8(last_s + one);
+    let qbase = exp2_8_in_range::<FAST>(sp(start + 4) * ln_ls1); // (last_s+1)^fail_s_exp[start+4]
     // fail_d_exp DROPPED: post-lapse stability is D-independent, so the legacy `pr` cache field now
     // holds just rexp (no pp = last_d^-fail_d_exp factor, so ln(last_d) is not needed).
-    let pr = exp8_in_range::<FAST>((one - r) * sp(start + 5)); // rexp = exp((1-r)*fail_r_mult[start+5])
+    let pr = exp2_8_in_range::<FAST>((one - r) * k(wc.l2e[start + 5])); // rexp = exp((1-r)*fail_r_mult[start+5])
     let nsf_fail = sp(start + 3) * pr * (qbase - one);
     let pls = last_s.fast_min(nsf_fail);
     let nss = pls.fast_max(ls_sinc);
@@ -910,11 +944,17 @@ fn stab8_bwd(
 
 /// f32x8 next-difficulty forward; returns (clamped out, pre-clamp out, delta_d) for the backward.
 #[inline(always)]
-fn next_d8_fwd(w: &[f32], last_d: f32x8, rating: f32x8, r: f32x8, init: f32) -> (f32x8, f32x8, f32x8) {
+fn next_d8_fwd(
+    w: &[f32], last_d: f32x8, rating: f32x8, r: f32x8, init: f32, lapse: bool,
+) -> (f32x8, f32x8, f32x8) {
     let k = f32x8::splat;
     let delta_d_base = k(-w[6]) * (rating - k(3.0));
     // Surprise-weighted lapse: on a lapse scale delta_d by (r+0.1) = 1 + (R-0.9).
-    let delta_d = rating.cmp_eq(k(1.0)).blend(delta_d_base * (r + k(0.1)), delta_d_base);
+    let delta_d = if lapse {
+        rating.cmp_eq(k(1.0)).blend(delta_d_base * (r + k(0.1)), delta_d_base)
+    } else {
+        delta_d_base
+    };
     let new_d = last_d + (k(10.0) - last_d) * delta_d / k(9.0);
     let out_pre = k(0.01) * k(init) + k(0.99) * new_d;
     (clamp8(out_pre, D_MIN, D_MAX), out_pre, delta_d) // delta_d returned = EFFECTIVE delta_d
@@ -926,7 +966,7 @@ fn next_d8_fwd(w: &[f32], last_d: f32x8, rating: f32x8, r: f32x8, init: f32) -> 
 #[inline(always)]
 fn next_d8_bwd(
     w: &[f32], out_pre: f32x8, delta_d: f32x8, last_d: f32x8, rating: f32x8, r: f32x8, g_out: f32x8,
-    gw: &mut [f32x8; 34], exp3w5: f64,
+    gw: &mut [f32x8; 34], exp3w5: f64, lapse: bool,
 ) -> (f32x8, f32x8) {
     let k = f32x8::splat;
     let z = k(0.0);
@@ -938,6 +978,10 @@ fn next_d8_bwd(
     let g_last_d = g_new_d * (k(1.0) - delta_d / k(9.0));
     let g_delta_d = g_new_d * (k(10.0) - last_d) / k(9.0);
     let rm3 = rating - k(3.0);
+    if !lapse {
+        gw[6] += g_delta_d * (z - rm3); // d(delta_d)/d(w6) = -(rating-3)
+        return (g_last_d, z);
+    }
     let is_lapse = rating.cmp_eq(k(1.0));
     // d(delta_d_eff)/d(w6) = -(rating-3), scaled by (r+0.1) on a lapse.
     gw[6] += g_delta_d * is_lapse.blend((z - rm3) * (r + k(0.1)), z - rm3);
@@ -988,15 +1032,15 @@ pub(crate) fn batch_loss_simd(
                 let s_c = clamp8(s, S_MIN, S_MAX);
                 let d_c = clamp8(d, D_MIN, D_MAX);
                 let sf_c = clamp8(sf, S_MIN, S_MAX);
-                let ln_s = ln8::<false>(s_c);
-                let ln_sf = ln8::<false>(sf_c);
+                let ln_s = log2_8(s_c);
+                let ln_sf = log2_8(sf_c);
                 let curve = curve8_fwd::<false>(w, dt, s_c, sf_c, d_c, &wc, ln_s, ln_sf);
                 let rr = curve.out;
-                let ns = stab8_fwd::<false>(w, s_c, d_c, rr, rating, 7, wc.aa7, ln_s).out;
-                let nsf_raw = stab8_fwd::<false>(w, sf_c, d_c, curve.r1, rating, 15, wc.aa16, ln_sf).out;
+                let ns = stab8_fwd::<false>(w, &wc, s_c, d_c, rr, rating, 7, wc.aa7, ln_s).out;
+                let nsf_raw = stab8_fwd::<false>(w, &wc, sf_c, d_c, curve.r1, rating, 15, wc.aa16, ln_sf).out;
                 // POST-LAPSE short reset: on a lapse cap s_short at 0.8 * post-lapse s_long.
                 let nsf = rating.cmp_eq(one).blend(nsf_raw.fast_min(k(0.8) * ns), nsf_raw);
-                let nd = next_d8_fwd(w, d_c, rating, rr, wc.init).0;
+                let nd = next_d8_fwd(w, d_c, rating, rr, wc.init, true).0;
                 // rating==0 (padding) passes the state through unchanged.
                 let m0 = rating.cmp_eq(k(0.0));
                 s = clamp8(m0.blend(s_c, ns), S_MIN, S_MAX);
@@ -1006,7 +1050,7 @@ pub(crate) fn batch_loss_simd(
         }
         let dts = load8(delta_ts, c0);
         let r = clamp8(
-            curve8_fwd::<false>(w, dts, s, sf, d, &wc, ln8::<false>(s), ln8::<false>(sf)).out,
+            curve8_fwd::<false>(w, dts, s, sf, d, &wc, log2_8(s), log2_8(sf)).out,
             MIN_R,
             MAX_R,
         );
@@ -1059,6 +1103,8 @@ pub(crate) enum Step8 {
         fast: Stab8,
         nd_out_pre: f32x8,
         nd_delta_d: f32x8,
+        /// Some lane lapses (rating 1) at this step; else the lapse-only terms are skipped.
+        lapse: bool,
     },
 }
 
@@ -1104,16 +1150,21 @@ fn step8_fwd<const FAST: bool, const PAD: bool>(
         // The incoming state is a previous step8_fwd output, which is already clamped (the first
         // step clamps its init values too), so clamping it again would change nothing.
         let (last_s, last_d, last_sf) = (s0, d0, sf0);
-        let ln_last_s = ln8::<FAST>(last_s);
-        let ln_last_sf = ln8::<FAST>(last_sf);
+        let ln_last_s = log2_8(last_s);
+        let ln_last_sf = log2_8(last_sf);
         let curve = curve8_fwd::<FAST>(w, dt_raw, last_s, last_sf, last_d, wc, ln_last_s, ln_last_sf);
         let r = curve.out;
         let r1 = curve.r1; // short component recall — drives the short-trace update (iter-71)
-        let slow = stab8_fwd::<FAST>(w, last_s, last_d, r, rating, 7, wc.aa7, ln_last_s);
-        let fast = stab8_fwd::<FAST>(w, last_sf, last_d, r1, rating, 15, wc.aa16, ln_last_sf);
-        let (nd, nd_out_pre, nd_delta_d) = next_d8_fwd(w, last_d, rating, r, wc.init);
+        let slow = stab8_fwd::<FAST>(w, wc, last_s, last_d, r, rating, 7, wc.aa7, ln_last_s);
+        let fast = stab8_fwd::<FAST>(w, wc, last_sf, last_d, r1, rating, 15, wc.aa16, ln_last_sf);
+        let lapse = rating.cmp_eq(one).any();
+        let (nd, nd_out_pre, nd_delta_d) = next_d8_fwd(w, last_d, rating, r, wc.init, lapse);
         // POST-LAPSE short reset (iter-97): on a lapse cap s_short at 0.8 * post-lapse s_long.
-        let nsf_pre = rating.cmp_eq(one).blend(fast.out.fast_min(k(0.8) * slow.out), fast.out);
+        let nsf_pre = if lapse {
+            rating.cmp_eq(one).blend(fast.out.fast_min(k(0.8) * slow.out), fast.out)
+        } else {
+            fast.out
+        };
         // PAD: rating==0 (padding) passes the input state through unchanged. Needed where a state is
         // read AFTER trailing padding (the O(N^2) paths score the final state). The windowed path
         // (PAD = false) never does: a card's padding only trails it, carries weight 0, and lanes are
@@ -1129,7 +1180,7 @@ fn step8_fwd<const FAST: bool, const PAD: bool>(
         (
             out,
             Step8::Full {
-                s0, d0, sf0, rating, curve, slow, fast, nd_out_pre, nd_delta_d,
+                s0, d0, sf0, rating, curve, slow, fast, nd_out_pre, nd_delta_d, lapse,
             },
         )
     }
@@ -1168,11 +1219,15 @@ fn step8_bwd<const PAD: bool>(
             (z, z, z)
         }
         Step8::Full {
-            s0, d0, sf0, rating, curve, slow, fast, nd_out_pre, nd_delta_d,
+            s0, d0, sf0, rating, curve, slow, fast, nd_out_pre, nd_delta_d, lapse,
         } => {
             // Cheap forward values recomputed with step8_fwd's exact ops (smaller per-step cache).
             let (last_s, last_d, last_sf) = (*s0, *d0, *sf0); // already clamped (see step8_fwd)
-            let nsf_pre = rating.cmp_eq(one).blend(fast.out.fast_min(k(0.8) * slow.out), fast.out);
+            let nsf_pre = if *lapse {
+                rating.cmp_eq(one).blend(fast.out.fast_min(k(0.8) * slow.out), fast.out)
+            } else {
+                fast.out
+            };
             // PAD: rating==0 padding passes the state through (output == input), so its adjoint
             // flows straight through (see step8_fwd; the windowed path does not need this).
             let m0 = rating.cmp_eq(z);
@@ -1190,10 +1245,16 @@ fn step8_bwd<const PAD: bool>(
                 (g_ns3, g_nsf3, g_nd3)
             };
             // POST-LAPSE min routing: nsf_pre = (rating==1)? min(fast.out, 0.8*slow.out) : fast.out.
-            let is_lapse = rating.cmp_eq(one);
-            let fast_wins = fast.out.cmp_le(k(0.8) * slow.out);
-            let g_fast_out = is_lapse.blend(fast_wins.blend(g_nsf2, z), g_nsf2);
-            let g_slow_from_relearn = is_lapse.blend(fast_wins.blend(z, g_nsf2 * k(0.8)), z);
+            let (g_fast_out, g_slow_from_relearn) = if *lapse {
+                let is_lapse = rating.cmp_eq(one);
+                let fast_wins = fast.out.cmp_le(k(0.8) * slow.out);
+                (
+                    is_lapse.blend(fast_wins.blend(g_nsf2, z), g_nsf2),
+                    is_lapse.blend(fast_wins.blend(z, g_nsf2 * k(0.8)), z),
+                )
+            } else {
+                (g_nsf2, z)
+            };
             // LONG stab reads mixed retention curve.out; SHORT stab reads r1=curve.r1 (start 15).
             let (g_ls_a, g_ld_a, g_r_long) =
                 stab8_bwd(
@@ -1206,7 +1267,7 @@ fn step8_bwd<const PAD: bool>(
                     gw,
                 );
             let (g_ld_c, g_r_nextd) =
-                next_d8_bwd(w, *nd_out_pre, *nd_delta_d, last_d, *rating, curve.out, g_nd2, gw, wc.exp3w5);
+                next_d8_bwd(w, *nd_out_pre, *nd_delta_d, last_d, *rating, curve.out, g_nd2, gw, wc.exp3w5, *lapse);
             // curve.out adjoint = long-stab r + windowed loss adjoint + next_d r; curve.r1 = short-stab r.
             let (g_ls_d, g_lsf_d, g_ld_d) = curve8_bwd(
                 w, curve, last_s, last_sf, last_d, g_r_long + g_r_loss + g_r_nextd, g_r1_short,
@@ -1274,8 +1335,8 @@ fn loss_and_grad_range_simd(
         let dts = load8(delta_ts, c0);
         let lbl = load8(labels, c0);
         let wt = load8(weights, c0);
-        let ln_s = ln8::<false>(s);
-        let ln_sf = ln8::<false>(sf);
+        let ln_s = log2_8(s);
+        let ln_sf = log2_8(sf);
         let fc = curve8_fwd::<false>(w, dts, s, sf, d, &wc, ln_s, ln_sf);
         let r_raw = fc.out;
         let r = clamp8(r_raw, MIN_R, MAX_R);
@@ -1340,17 +1401,25 @@ pub(crate) fn batch_loss_and_grad_simd(
 /// (1-|label-r|). ONE division (label is 0/1); padding/filtered steps have wt==0 -> 0; the
 /// [MIN_R,MAX_R] clamp zeroes the adjoint outside the range. (3b trade vs lbl/r - (1-lbl)/(1-r).)
 /// A fn, not a closure: LLVM did not inline the closure (a real call per step).
+/// `weights` are the windowed batches' SIGNED weights (signed_weight): sign(label - r) is +1 for
+/// label 1 and -1 for label 0 (r is inside (0, 1)), so (0 - wt) * (sign / den) is exactly
+/// swt * (1 / den) with swt = sign * (0 - wt) precomputed by the layout.
 #[inline(always)]
 fn g_r_loss_at(r_raw: f32x8, weights: &[f32], labels: &[f32], base: usize) -> f32x8 {
     let k = f32x8::splat;
     let (one, z) = (k(1.0), k(0.0));
-    let wt = load8(weights, base);
+    let swt = load8(weights, base);
     let lbl = load8(labels, base);
     let r = clamp8(r_raw, MIN_R, MAX_R);
     let dd = lbl - r;
-    let sgn = dd.cmp_gt(z).blend(one, z - one);
-    let g_r = (z - wt) * (sgn / (one - dd.fast_max(z - dd)));
+    let g_r = swt * (one / (one - dd.fast_max(z - dd)));
     (r_raw.cmp_gt(k(MIN_R)) & r_raw.cmp_lt(k(MAX_R))).blend(g_r, z)
+}
+
+/// The windowed layout's signed weight of a prediction with recency weight `w` and label `label`
+/// (see g_r_loss_at); `w` = 0 (no prediction) with label 0 gives -0.0. card_loss_simd reads |swt|.
+pub(crate) fn signed_weight(w: f32, label: f32) -> f32 {
+    if label == 1.0 { 0.0 - w } else { -(0.0 - w) }
 }
 
 /// Windowed forward + reverse-mode backward for one card-grouped batch. Accumulates d(loss)/d(w) into
@@ -1413,7 +1482,7 @@ pub(crate) fn card_group_grad(
     // outputs are already clamped) — the exact curve step8_fwd would compute.
     let lbase = (seq_len - 1) * batch + c0;
     let dt_last = load8(t_hist, lbase); // curve8_fwd/bwd clamp it at 0 themselves
-    let fc_last = curve8_fwd::<false>(w, dt_last, s, sf, d, wc, ln8::<false>(s), ln8::<false>(sf));
+    let fc_last = curve8_fwd::<false>(w, dt_last, s, sf, d, wc, log2_8(s), log2_8(sf));
     // Reverse pass. The final state's adjoint is 0, so at the last step the stab/next_d backward
     // all multiply 0 -> only curve8_bwd(loss-adjoint) contributes. BIT-FOR-BIT identical to a full
     // step8_bwd with g_out=0. The clamp gate uses the UNCLAMPED incoming state (= s0/d0/sf0).
@@ -1440,7 +1509,11 @@ fn finish_gw(gw_g: &[f32x8; 34], w: &[f32], wc: &WConsts) -> [f32; 34] {
     g[27] = s_z * wc.nrw27;
     g[28] = s_z * wc.rw28;
     g[26] = s_x2 * wc.k26;
-    g[24] = if wc.live24 { -(s_dec2 + s_x2 * wc.k24) } else { 0.0 };
+    g[24] = if wc.live24 { -(s_dec2 * LN2 + s_x2 * wc.k24) } else { 0.0 };
+    // Slots accumulated as g * log2(x) (the recurrence's logs are base 2): times ln2.
+    for i in [8, 11, 16, 19, 29, 30, 33] {
+        g[i] *= LN2;
+    }
     g[25] *= wc.rw25;
     g[10] *= 1.0 / w[10];
     g[18] *= 1.0 / w[18];
@@ -1477,7 +1550,7 @@ pub(crate) fn card_loss_simd(
                 clamp8(
                     curve8_fwd::<false>(
                         w, dt.fast_max(z), ls, lsf, ld, &wc,
-                        ln8::<false>(ls), ln8::<false>(lsf),
+                        log2_8(ls), log2_8(lsf),
                     )
                     .out,
                     MIN_R, MAX_R,
@@ -1495,7 +1568,7 @@ pub(crate) fn card_loss_simd(
                 // ln8. Padding/filtered lanes have weight 0. The BCE ln uses the accurate ::<false>,
                 // as does the forward recurrence now (iter23's cruder windowed minimax was reverted).
                 let lbl = load8(labels, base);
-                let wt = load8(weights, base);
+                let wt = load8(weights, base).abs(); // signed weights (signed_weight)
                 let arg = k(1.0) - (lbl - r).fast_max(r - lbl); // 1 - |label - r|
                 loss += ((z - wt) * ln8::<false>(arg)).reduce_add() as f64;
             }
@@ -1825,7 +1898,8 @@ mod tests {
         let loss_scalar =
             loss_and_grad_range_window(&w, &th, &rh, seq, batch, &lbl, &wts, &mut gs, 0, batch);
         let mut gv = [0.0f64; 34];
-        card_loss_and_grad_simd(&w, &th, &rh, seq, batch, &lbl, &wts, &mut gv);
+        let swts: Vec<f32> = wts.iter().zip(&lbl).map(|(&x, &l)| signed_weight(x, l)).collect();
+        card_loss_and_grad_simd(&w, &th, &rh, seq, batch, &lbl, &swts, &mut gv);
         let mut num = 0.0f64;
         let mut den = 0.0f64;
         for i in 0..34 {

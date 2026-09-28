@@ -1,5 +1,5 @@
 use crate::error::Result;
-use crate::model::{clip_parameters, clip_parameters_in_place, parameters_to_model, Model};
+use crate::model::{clip_parameters, clip_parameters_in_place};
 use crate::{DEFAULT_PARAMETERS, FSRSError};
 use burn::LearningRate;
 use burn::backend::Autodiff;
@@ -1380,15 +1380,9 @@ pub fn compute_parameters(
         &config,
         progress.clone().map(|p| ProgressCollector::new(p, 0)),
     );
-    let optimized_parameters = model
-        .inspect_err(|_e| {
-            finish_progress();
-        })?
-        .w
-        .val()
-        .to_data()
-        .to_vec()
-        .unwrap();
+    let optimized_parameters = model.inspect_err(|_e| {
+        finish_progress();
+    })?;
 
     finish_progress();
 
@@ -1488,8 +1482,7 @@ pub fn benchmark(
         &config,
         None,
     );
-    let parameters: Vec<f32> = model.unwrap().w.val().to_data().to_vec::<f32>().unwrap();
-    parameters
+    model.unwrap()
 }
 
 /// One batch pre-extracted to host arrays (used for BOTH train and validation). The data and
@@ -1665,7 +1658,7 @@ impl CardedPlan {
         let mut th = vec![0.0f32; seq * bsz];
         let mut rh = vec![0.0f32; seq * bsz];
         let mut lbl = vec![0.0f32; seq * bsz];
-        let mut wts = vec![0.0f32; seq * bsz];
+        let mut wts = vec![-0.0f32; seq * bsz]; // signed weights (analytic::signed_weight)
         let mut predictions = 0;
         for (c, &ci) in batch.iter().enumerate() {
             let reviews = &items[self.cards[ci].longest as usize].reviews;
@@ -1675,8 +1668,9 @@ impl CardedPlan {
             }
             for &(t, idx) in &self.by_card[self.start[ci]..self.start[ci + 1]] {
                 let t = t as usize;
-                wts[t * bsz + c] = weight(idx as usize, length);
-                lbl[t * bsz + c] = if reviews[t].rating == 1 { 0.0 } else { 1.0 };
+                let label = if reviews[t].rating == 1 { 0.0 } else { 1.0 };
+                wts[t * bsz + c] = crate::analytic::signed_weight(weight(idx as usize, length), label);
+                lbl[t * bsz + c] = label;
             }
             predictions += self.cards[ci].n_preds as usize;
         }
@@ -1792,7 +1786,7 @@ fn train<B: AutodiffBackend>(
     initial_parameters: &[f32],
     config: &TrainingConfig,
     progress: Option<ProgressCollector>,
-) -> Result<Model<B>> {
+) -> Result<Vec<f32>> {
     B::seed(config.seed);
 
     // Training data: the caller builds the host batches ONCE (before the epoch loop); reused every
@@ -2077,7 +2071,9 @@ fn train<B: AutodiffBackend>(
     // epoch's (the 9th-epoch default below compensates — dropping the selection can only
     // raise the loss by construction, the extra epoch buys it back at a fraction of the
     // validation pass's cost).
-    Ok(parameters_to_model::<B>(&w_host, &B::Device::default()))
+    // The clipped parameters (what parameters_to_model would store), without the burn Model
+    // round trip (~20 us per call).
+    Ok(clip_parameters(&w_host))
 }
 
 struct NoProgress {}
