@@ -11,8 +11,8 @@ Reads ``result/history.jsonl`` and draws TWO stacked views vs iteration
    within-session *paired* ratio, so cross-session machine drift cancels.
    Rejected variants are drawn where they would have landed
    (current cumulative x their ``speed_ratio``). Only the TOP-N biggest wins
-   (highest per-iteration ``speed_ratio``) are labelled with their summary, so the
-   panel stays readable as the campaign grows (``--label-top``, default 5).
+   (highest per-iteration ``speed_ratio``) are labelled, with the iteration number only
+   (full summaries overlapped), so the panel stays readable (``--label-top``, default 5).
 2. Median per-user time (ms) — intuitive, but MACHINE-SPECIFIC and measured per
    session, so it is NOT the accept/reject metric. Informational only.
 
@@ -36,7 +36,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import textwrap
 from pathlib import Path
 
 import matplotlib
@@ -71,25 +70,6 @@ def load(path: Path) -> list[dict]:
     rows = [r for r in rows if r.get("time_after") is not None]
     rows.sort(key=lambda r: r["iteration"])
     return rows
-
-
-def wrap_summary(s: str, width: int) -> str:
-    """
-    Wrap the full summary text.
-
-    Important: this does NOT truncate or add "...". The previous version cut
-    summaries to --summary-len before wrapping, which is why labels showed "..."
-    even when there was enough plot space.
-    """
-    s = " ".join((s or "").split())
-    return "\n".join(
-        textwrap.wrap(
-            s,
-            width=width,
-            break_long_words=True,
-            break_on_hyphens=True,
-        )
-    )
 
 
 def cumulative(rows: list[dict]):
@@ -150,19 +130,13 @@ def main() -> None:
     ap.add_argument(
         "--no-summaries",
         action="store_true",
-        help="hide the champion summary labels on the speedup panel",
+        help="hide the champion iteration labels on the speedup panel",
     )
     ap.add_argument(
         "--label-top",
         type=int,
         default=5,
         help="label only the N biggest wins (highest speed_ratio) on the speedup panel (default 5)",
-    )
-    ap.add_argument(
-        "--summary-wrap",
-        type=int,
-        default=12,
-        help="wrap summary labels at this many chars per line (default 12)",
     )
     ap.add_argument(
         "--rotation",
@@ -218,25 +192,23 @@ def main() -> None:
         # Only label the TOP-N biggest wins (highest per-iteration speed_ratio among the accepted
         # champions). Annotating every champion cluttered the panel as the campaign grew; the
         # baseline (iter 0, no change) and rejects are never labelled. Each label is prefixed with
-        # its iteration and per-iteration speedup so the big wins are self-evident.
+        # its iteration number only (full summaries overlapped; the history .md has them).
         labellable = [(it, y, r) for it, y, r in champ_pts if r["iteration"] != 0]
         biggest = sorted(labellable, key=lambda p: float(p[2].get("speed_ratio") or 1.0), reverse=True)
         top_iters = {p[0] for p in biggest[: max(0, args.label_top)]}
         for it, y, r in champ_pts:
             if r["iteration"] == 0 or it not in top_iters:
                 continue
-            sr = float(r.get("speed_ratio") or 1.0)
-            label = wrap_summary(f"#{it} ×{sr:.2f}  " + r.get("summary", ""), args.summary_wrap)
             ax_sp.annotate(
-                label,
+                f"#{it}",
                 (it, y),
                 textcoords="offset points",
                 xytext=(0, 6),
                 rotation=args.rotation,
                 rotation_mode="anchor",
-                ha="left",
+                ha="center",
                 va="bottom",
-                fontsize=7,
+                fontsize=9,
                 color=GREEN_DARK,
                 annotation_clip=False,
                 clip_on=False,
@@ -254,7 +226,8 @@ def main() -> None:
 
     ylo, yhi = min(cy + [1.0]), max(cy + [1.0])
     yr = (yhi - ylo) or 1.0
-    pad_top = (0.5 if not args.no_summaries else 0.10) * yr
+    # Room above the highest point so its label stays clear of the upper-right legend.
+    pad_top = (0.35 if not args.no_summaries else 0.25) * yr
     ax_sp.set_ylim(ylo - 0.05 * yr - 0.01, yhi + pad_top + 0.01)
 
     # ---- Bottom panel: median time (machine-specific; NOT the accept metric) ----
