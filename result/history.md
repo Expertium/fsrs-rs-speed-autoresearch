@@ -37,6 +37,7 @@ Accept metric: **median per-user speed_ratio ≥ 1.05** (constraint 12) AND **sp
 | 30 | 22 | 15 | 1.333 | 10601 | 10607 | 1.001 | 1.001 | ✓ | accepted | Force-inline the SIMD step, curve, stability and difficulty functions into the time loops |
 | 31 | 14 | 16 | 0.951 | 10607 | 10607 | 1.000 | 1.000 | ✓ | rejected | Build the binding with fat LTO and one codegen unit |
 | 32 | 14 | 16 | 1.000 | 10602 | 10712 | 1.010 | 1.026 | ✓ | rejected | Run two 8-card groups in lockstep so their recurrences overlap |
+| 33 | 14 | 13 | 1.101 | 10607 | 10603 | 1.000 | 0.999 | ✓ | accepted | Stack: exp8 single-convert rounding, peel first step, drop dead/cheap cache fields |
 
-**Cumulative speed_ratio (product of accepted): ×182.333** — upward-biased (winner's curse); anchor periodically vs iter-0 baseline.
+**Cumulative speed_ratio (product of accepted): ×200.748** — upward-biased (winner's curse); anchor periodically vs iter-0 baseline.
 
