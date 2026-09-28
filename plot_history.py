@@ -208,7 +208,7 @@ def main() -> None:
                 rotation_mode="anchor",
                 ha="center",
                 va="bottom",
-                fontsize=9,
+                fontsize=12,
                 color=GREEN_DARK,
                 annotation_clip=False,
                 clip_on=False,
@@ -220,7 +220,7 @@ def main() -> None:
             transform=ax_sp.transAxes,
             ha="left",
             va="top",
-            fontsize=9,
+            fontsize=12,
             color=GREEN_DARK,
             bbox=dict(boxstyle="round", facecolor="white", edgecolor="0.8", alpha=0.9),
         )
