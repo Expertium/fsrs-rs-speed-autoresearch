@@ -39,6 +39,7 @@ Accept metric: **median per-user speed_ratio ≥ 1.05** (constraint 12) AND **sp
 | 32 | 14 | 16 | 1.000 | 10602 | 10712 | 1.010 | 1.026 | ✓ | rejected | Run two 8-card groups in lockstep so their recurrences overlap |
 | 33 | 14 | 13 | 1.101 | 10607 | 10603 | 1.000 | 0.999 | ✓ | accepted | Stack: exp8 single-convert rounding, peel first step, drop dead/cheap cache fields |
 | 34 | 12 | 13 | 0.948 | 10603 | 10603 | 1.000 | 1.000 | ✓ | rejected | Run the SIMD kernels 4 cards per lane (f32x4) instead of 8 |
+| 35 | 12 | 12 | 1.046 | 10603 | 10622 | 1.002 | 1.004 | ✓ | rejected | Stack: inline loss-grad helper, one-check load8, cache iterator, drop proven-redundant exp clamps |
 
 **Cumulative speed_ratio (product of accepted): ×200.748** — upward-biased (winner's curse); anchor periodically vs iter-0 baseline.
 
