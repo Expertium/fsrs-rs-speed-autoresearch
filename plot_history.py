@@ -213,6 +213,17 @@ def main() -> None:
                 annotation_clip=False,
                 clip_on=False,
             )
+        ax_sp.text(
+            0.01,
+            0.97,
+            f"#N marks the {len(top_iters)} iterations with the biggest relative gains",
+            transform=ax_sp.transAxes,
+            ha="left",
+            va="top",
+            fontsize=9,
+            color=GREEN_DARK,
+            bbox=dict(boxstyle="round", facecolor="white", edgecolor="0.8", alpha=0.9),
+        )
 
     ax_sp.set_ylabel("Cumulative speedup vs baseline (×)\nhigher=better", fontsize=14)
     _phase = "benchmark() " if args.benchmark else ""
