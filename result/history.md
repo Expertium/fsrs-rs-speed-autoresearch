@@ -45,6 +45,7 @@ Accept metric: **median per-user speed_ratio ≥ 1.05** (constraint 12) AND **sp
 | 38 | 12 | 12 | 0.995 | 10775 | 10788 | 1.001 | 1.004 | ✓ | rejected | exp8: add n to the polynomial's exponent bits instead of multiplying by 2^n |
 | 39 | 11 | 10 | 1.052 | 10775 | 10869 | 1.009 | 1.022 | ✓ | accepted | Helper lays out batches in training order; no per-step clock reads, allocations, dead penalty value |
 | 40 | 11 | 10 | 1.065 | 10869 | 10907 | 1.004 | 1.009 | ✓ | accepted | Curve mix as sigmoid (one exp fewer) + exact kernel, plan, penalty, Adam trims |
+| 41 | 10 | 9 | 1.053 | 10907 | 10916 | 1.001 | 1.002 | ✓ | accepted | Backward: share product adjoints, merge divisions, apply weight-only factors once per group |
 
-**Cumulative speed_ratio (product of accepted): ×261.476** — upward-biased (winner's curse); anchor periodically vs iter-0 baseline.
+**Cumulative speed_ratio (product of accepted): ×275.256** — upward-biased (winner's curse); anchor periodically vs iter-0 baseline.
 

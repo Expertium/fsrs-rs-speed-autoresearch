@@ -120,15 +120,14 @@ pub(crate) struct WConsts {
     // Weight-only terms of the SIMD curve's second component (decay2 = -clamp(w24) is not state-
     // modulated), computed once per call with the same f32x8 ops curve8_fwd/bwd used per step.
     decay2: f32x8,
-    inv2: f32x8,
-    p28: f32x8,
-    factor2: f32x8,
-    m2_live: f32x8, // clamp gate of m2 = w24 (all-ones lanes where 0.01 < w24 < 0.95)
-    p28_w26: f32x8, // p28 / base2[w26]
-    nid2: f32x8,    // -1 / decay2^2
+    factor2: f32x8, // p28 - 1, p28 = base2[w26]^(1/decay2)
     ln_w28_w27: f32, // ln(base_weight2[w28] / base_weight1[w27]): the constant term of the mix logit
     nrw27: f32,      // -1 / w27 = d(logit)/d(w27)
     rw28: f32,       // 1 / w28 = d(logit)/d(w28)
+    rw25: f32,       // 1 / w25 = d(ln base1)/d(w25)
+    k26: f32,        // (d(p28)/d(w26)) / factor2 = (p28 / (decay2 * w26)) / factor2
+    k24: f32,        // (d(p28)/d(w24)) / factor2 = -(p28 * ln(w26) * (-1/decay2^2)) / factor2
+    live24: bool,    // 0.01 < w24 < 0.95 (decay2's clamp is inactive)
 }
 
 pub(crate) fn wconsts(w: &[f32]) -> WConsts {
@@ -137,6 +136,7 @@ pub(crate) fn wconsts(w: &[f32]) -> WConsts {
     let decay2 = k(0.0) - clamp8(m2, 0.01, 0.95);
     let inv2 = k(1.0) / decay2;
     let p28 = exp8::<false>(inv2 * k(w[26].ln()));
+    let factor2 = p28 - k(1.0);
     WConsts {
         ln_w27: w[25].ln(),
         ln_w28: w[26].ln(),
@@ -145,15 +145,14 @@ pub(crate) fn wconsts(w: &[f32]) -> WConsts {
         init: w[4] - (w[5] * 3.0).exp() + 1.0,
         exp3w5: (w[5] as f64 * 3.0).exp(),
         decay2,
-        inv2,
-        p28,
-        factor2: p28 - k(1.0),
-        m2_live: m2.cmp_gt(k(0.01)) & m2.cmp_lt(k(0.95)),
-        p28_w26: p28 / k(w[26]),
-        nid2: k(0.0) - k(1.0) / (decay2 * decay2),
+        factor2,
         ln_w28_w27: (w[28] / w[27]).ln(),
         nrw27: -1.0 / w[27],
         rw28: 1.0 / w[28],
+        rw25: 1.0 / w[25],
+        k26: (inv2 * (p28 / k(w[26])) / factor2).to_array()[0],
+        k24: (p28 * k(w[26].ln()) * (k(0.0) - k(1.0) / (decay2 * decay2)) / factor2).to_array()[0],
+        live24: w[24] > 0.01 && w[24] < 0.95,
     }
 }
 
@@ -649,14 +648,13 @@ fn load8(s: &[f32], i: usize) -> f32x8 {
 struct Curve8 {
     out: f32x8,
     a: f32x8,
-    bv: f32x8,
+    q2: f32x8,
     r1: f32x8,
     q1: f32x8,
     e1: f32x8,
     p35: f32x8,
     b2: f32x8,
     r2: f32x8,
-    ex34: f32x8,
     sig: f32x8,
     oms: f32x8,
     ln_sf: f32x8,
@@ -693,7 +691,8 @@ fn curve8_fwd<const FAST: bool>(
     // is now the TIME-SCALE inside b2.
     let ex34 = exp8_in_range::<FAST>((d - k(5.0)) * (sp(32) - k(0.3)));
     // decay2 / p28 = base2[w26]^inv2 / factor2 are weight-only: hoisted into wc.
-    let b2 = bv * wc.factor2 * ex34 + k(1.0);
+    let q2 = bv * wc.factor2 * ex34;
+    let b2 = q2 + k(1.0);
     let ln_b2 = ln8::<FAST>(b2);
     let r2 = exp8_in_range::<FAST>(wc.decay2 * ln_b2);
     // ret = (weight1*r1 + weight2*r2) / (weight1 + weight2), weight1 = base_weight1[w27] *
@@ -708,7 +707,7 @@ fn curve8_fwd<const FAST: bool>(
     let ret = r1 * oms + r2 * sig;
     let out = ret * k(1.0 - 2e-5) + k(1e-5);
     Curve8 {
-        out, a, bv, r1, q1, e1, p35, b2, r2, ex34, sig, oms, ln_sf, ln_b1, ln_b2, ln_s,
+        out, a, q2, r1, q1, e1, p35, b2, r2, sig, oms, ln_sf, ln_b1, ln_b2, ln_s,
     }
 }
 
@@ -717,13 +716,12 @@ fn curve8_fwd<const FAST: bool>(
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn curve8_bwd(
-    w: &[f32], c: &Curve8, t: f32x8, s: f32x8, sf: f32x8, d: f32x8, g_out: f32x8, g_r1_extra: f32x8,
+    w: &[f32], c: &Curve8, s: f32x8, sf: f32x8, d: f32x8, g_out: f32x8, g_r1_extra: f32x8,
     gw: &mut [f32x8; 34], wc: &WConsts,
 ) -> (f32x8, f32x8, f32x8) {
     let sp = |i: usize| f32x8::splat(w[i]);
     let k = f32x8::splat;
     let z = k(0.0);
-    let t = t.fast_max(z);
     // Cheap forward values recomputed with curve8_fwd's exact ops (smaller per-step cache).
     let m1 = sp(23) * c.p35;
     let decay1 = k(0.0) - clamp8(m1, 0.01, 0.95);
@@ -736,50 +734,39 @@ fn curve8_bwd(
     let g_r2 = g_ret * c.sig;
     // sig = sigmoid(z), dsig/dz = sig*(1-sig); z = ln(w28/w27) + w30*ln_s + (w31-0.5)*(d-5) + w29*ln_sf
     let g_z = g_ret * (c.r2 - c.r1) * (c.sig * c.oms);
-    gw[27] += g_z * k(wc.nrw27);
-    gw[28] += g_z * k(wc.rw28);
+    // Weight-only factors are applied once per group in finish_gw (slot 27 holds sum(g_z)).
+    gw[27] += g_z;
     gw[29] += g_z * c.ln_sf;
     gw[30] += g_z * c.ln_s;
     gw[31] += g_z * (d - k(5.0));
     let mut g_d = g_z * (sp(31) - k(0.5));
-    let mut g_s = g_z * sp(30) / s;
-    let mut g_sf = g_z * sp(29) / sf;
-    // r2 = b2^decay2 ; iter-165: b2 = bv*factor2*ex34 + 1 (ex34 = D time-scale) and
-    // decay2 = -clamp(w24) is no longer d-modulated.
+    // r2 = b2^decay2, b2 = q2 + 1 with q2 = (t/s)*factor2*ex34 (ex34 = exp((d-5)*(d_decay-0.3)),
+    // factor2 = p28 - 1, p28 = base2[w26]^(1/decay2), decay2 = -clamp(w24)). q2 is a product, so
+    // the adjoints of ln(t/s), ln(ex34) and ln(factor2) are all x2 = g_b2*q2.
     let g_b2 = g_r2 * wc.decay2 * (c.r2 / c.b2);
-    let mut g_decay2 = g_r2 * c.r2 * c.ln_b2;
-    let g_bv = g_b2 * wc.factor2 * c.ex34;
-    let g_factor2 = g_b2 * c.bv * c.ex34;
-    let g_ex34 = g_b2 * c.bv * wc.factor2;
-    g_d += g_ex34 * c.ex34 * (sp(32) - k(0.3)); // ex34 = exp((d-5)*(d_decay-0.3))
-    gw[32] += g_ex34 * c.ex34 * (d - k(5.0));
-    let g_p28 = g_factor2;
-    gw[26] += g_p28 * wc.inv2 * wc.p28_w26; // p28 = base2[w26]^inv2
-    let g_inv2 = g_p28 * wc.p28 * k(wc.ln_w28);
-    g_decay2 += g_inv2 * wc.nid2;
-    let g_dm2 = z - g_decay2;
-    let g_m2 = wc.m2_live.blend(g_dm2, z);
-    gw[24] += g_m2; // m2 = w24 directly (clamp gate via c.m2)
-    g_s += g_bv * (z - t / (s * s)); // bv = t/s
-    // r1 = b1^decay1
+    let x2 = g_b2 * c.q2;
+    g_d += x2 * (sp(32) - k(0.3));
+    gw[32] += x2 * (d - k(5.0));
+    // w26 and w24 enter r2 only through weight-only factors: slot 26 holds sum(x2), slot 28 the
+    // direct decay2 term; finish_gw forms gw[26] and gw[24] from them.
+    gw[26] += x2;
+    gw[28] += g_r2 * c.r2 * c.ln_b2;
+    // r1 = b1^decay1, b1 = a*factor1 + 1, a = t/sf, factor1 = e1 - 1, e1 = exp(min(q1, 60)),
+    // q1 = ln(base1[w25]) / decay1, decay1 = -clamp(w23 * p35), p35 = sf^(s_decay1[w33]-0.3).
     let g_b1 = g_r1 * decay1 * (c.r1 / b1);
     let mut g_decay1 = g_r1 * c.r1 * c.ln_b1;
-    let g_a = g_b1 * factor1;
-    let g_factor1 = g_b1 * c.a;
-    let g_e1 = g_factor1;
-    let g_q1c = g_e1 * c.e1;
-    let g_q1 = c.q1.cmp_lt(k(60.0)).blend(g_q1c, z);
-    // q1 = ln(base1) / decay1
+    let g_a_a = g_b1 * factor1 * c.a; // adjoint of ln(a)
+    let g_q1 = c.q1.cmp_lt(k(60.0)).blend(g_b1 * c.a * c.e1, z);
     let g_lw27 = g_q1 / decay1;
-    g_decay1 += g_q1 * (z - k(wc.ln_w27) / (decay1 * decay1));
-    gw[25] += g_lw27 / sp(25); // ln_base1 = ln(w[25])
-    let g_dm1 = z - g_decay1;
-    let g_m1 = (m1.cmp_gt(k(0.01)) & m1.cmp_lt(k(0.95))).blend(g_dm1, z);
-    gw[23] += g_m1 * c.p35; // m1 = decay1[w23] * p35
-    let g_p35 = g_m1 * sp(23);
-    g_sf += g_p35 * (sp(33) - k(0.3)) * (c.p35 / sf); // p35 = s_short^(s_decay1-0.3)
-    gw[33] += g_p35 * c.p35 * c.ln_sf;
-    g_sf += g_a * (z - t / (sf * sf)); // a = t/sf
+    g_decay1 -= g_lw27 * c.q1; // d(q1)/d(decay1) = -q1/decay1
+    gw[25] += g_lw27; // ln_base1 = ln(w[25]); finish_gw applies 1/w25
+    let g_m1 = (m1.cmp_gt(k(0.01)) & m1.cmp_lt(k(0.95))).blend(z - g_decay1, z);
+    gw[23] += g_m1 * c.p35;
+    let y = g_m1 * sp(23) * c.p35; // adjoint of ln(p35)
+    gw[33] += y * c.ln_sf;
+    // d/ds and d/dsf of every ln(s)/ln(sf) term, over ONE division each.
+    let g_s = (g_z * sp(30) - x2) / s;
+    let g_sf = (g_z * sp(29) + y * (sp(33) - k(0.3)) - g_a_a) / sf;
     (g_s, g_sf, g_d)
 }
 
@@ -866,9 +853,10 @@ fn stab8_bwd(
     let g_prod = g_sinc;
     let base = aa * bb * c.cc * em1;
     let prod = base * he;
-    gw[start] += g_prod * prod; // aa = exp(w[start]-1.5); dprod/dw[start] = prod
+    // prod is a product, so the adjoint of ln(aa) and of ln(cc) are both g_prod * prod.
+    let p_ln = g_prod * prod;
+    gw[start] += p_ln; // aa = exp(w[start]-1.5)
     let g_bb = g_prod * (aa * c.cc * em1 * he);
-    let g_cc = g_prod * (aa * bb * em1 * he);
     let g_em1 = g_prod * (aa * bb * c.cc * he);
     // d(prod)/d(hard_penalty) on rating-2 lanes and d(prod)/d(easy_bonus) on rating-4 lanes are
     // both `base` (the other factor is exactly 1 there).
@@ -876,24 +864,24 @@ fn stab8_bwd(
     gw[start + 6] += rating.cmp_eq(k(2.0)).blend(g_base, z); // hard_penalty
     gw[start + 7] += rating.cmp_eq(k(4.0)).blend(g_base, z); // easy_bonus
     let g_last_d = g_bb * (z - one); // bb = 11 - last_d (the ONLY D-dependence of stab now)
-    g_last_s += g_cc * k(-w[start + 1]) * (c.cc / last_s);
-    gw[start + 1] += g_cc * (z - c.cc * ln_ls);
+    // cc = last_s^-w[start+1] = exp(-w[start+1] * ln_ls)
+    g_last_s += p_ln * k(-w[start + 1]) / last_s;
+    gw[start + 1] -= p_ln * ln_ls;
     // expr = exp((1-r)*w[start+2])
     let mut g_r = g_em1 * c.expr * k(-w[start + 2]);
     gw[start + 2] += g_em1 * c.expr * (one - r);
     // nsf_fail = fail_mult[start+3] * pr * (qbase-1) ; pr = rexp = exp((1-r)*fail_r_mult[start+5])
     // (fail_d_exp DROPPED: no pp = last_d^-x factor, so nsf_fail is D-independent).
-    let q = c.qbase - one;
-    gw[start + 3] += g_nsf_fail * (c.pr * q);
-    let g_pr = g_nsf_fail * sp(start + 3) * q; // adjoint on pr(=rexp)
-    let g_q = g_nsf_fail * sp(start + 3) * c.pr; // adjoint on (qbase-1)
-    let g_pr_pr = g_pr * c.pr; // shared  pr * d(pr)/d(.)  factor
+    // The adjoint of ln(fail_mult) and of ln(pr) are both n_ln = g_nsf_fail * nsf_fail.
+    let n_ln = g_nsf_fail * c.nsf_fail;
+    gw[start + 3] += n_ln; // finish_gw applies 1/fail_mult
     // pr = exp((1-r)*fail_r_mult[start+5])
-    g_r += g_pr_pr * k(-w[start + 5]); // d(pr)/d(r) = pr*(-fail_r_mult)
-    gw[start + 5] += g_pr_pr * (one - r); // d(pr)/d(fail_r_mult) = pr*(1-r)
-    // qbase = (last_s+1)^fail_s_exp[start+4]
-    g_last_s += g_q * sp(start + 4) * (c.qbase / (last_s + one));
-    gw[start + 4] += g_q * c.qbase * c.ln_ls1;
+    g_r += n_ln * k(-w[start + 5]);
+    gw[start + 5] += n_ln * (one - r);
+    // qbase = (last_s+1)^fail_s_exp[start+4]; q_ln = adjoint of ln(qbase)
+    let q_ln = g_nsf_fail * sp(start + 3) * c.pr * c.qbase;
+    g_last_s += q_ln * sp(start + 4) / (last_s + one);
+    gw[start + 4] += q_ln * c.ln_ls1;
     (g_last_s, g_last_d, g_r)
 }
 
@@ -1043,7 +1031,6 @@ pub(crate) enum Step8 {
         d0: f32x8,
         sf0: f32x8,
         rating: f32x8,
-        dt: f32x8,
         curve: Curve8,
         slow: Stab8,
         fast: Stab8,
@@ -1094,10 +1081,9 @@ fn step8_fwd<const FAST: bool>(
         // The incoming state is a previous step8_fwd output, which is already clamped (the first
         // step clamps its init values too), so clamping it again would change nothing.
         let (last_s, last_d, last_sf) = (s0, d0, sf0);
-        let dt = dt_raw; // curve8_fwd/bwd clamp it at 0 themselves
         let ln_last_s = ln8::<FAST>(last_s);
         let ln_last_sf = ln8::<FAST>(last_sf);
-        let curve = curve8_fwd::<FAST>(w, dt, last_s, last_sf, last_d, wc, ln_last_s, ln_last_sf);
+        let curve = curve8_fwd::<FAST>(w, dt_raw, last_s, last_sf, last_d, wc, ln_last_s, ln_last_sf);
         let r = curve.out;
         let r1 = curve.r1; // short component recall — drives the short-trace update (iter-71)
         let slow = stab8_fwd::<FAST>(w, last_s, last_d, r, rating, 7, wc.aa7, ln_last_s);
@@ -1114,7 +1100,7 @@ fn step8_fwd<const FAST: bool>(
         (
             out,
             Step8::Full {
-                s0, d0, sf0, rating, dt, curve, slow, fast, nd_out_pre, nd_delta_d,
+                s0, d0, sf0, rating, curve, slow, fast, nd_out_pre, nd_delta_d,
             },
         )
     }
@@ -1153,7 +1139,7 @@ fn step8_bwd(
             (z, z, z)
         }
         Step8::Full {
-            s0, d0, sf0, rating, dt, curve, slow, fast, nd_out_pre, nd_delta_d,
+            s0, d0, sf0, rating, curve, slow, fast, nd_out_pre, nd_delta_d,
         } => {
             // Cheap forward values recomputed with step8_fwd's exact ops (smaller per-step cache).
             let (last_s, last_d, last_sf) = (*s0, *d0, *sf0); // already clamped (see step8_fwd)
@@ -1191,7 +1177,7 @@ fn step8_bwd(
                 next_d8_bwd(w, *nd_out_pre, *nd_delta_d, last_d, *rating, curve.out, g_nd2, gw, wc.exp3w5);
             // curve.out adjoint = long-stab r + windowed loss adjoint + next_d r; curve.r1 = short-stab r.
             let (g_ls_d, g_lsf_d, g_ld_d) = curve8_bwd(
-                w, curve, *dt, last_s, last_sf, last_d, g_r_long + g_r_loss + g_r_nextd, g_r1_short,
+                w, curve, last_s, last_sf, last_d, g_r_long + g_r_loss + g_r_nextd, g_r1_short,
                 gw, wc,
             );
             let g_last_s = g_ls_a + g_ls_d + g_last_s_extra;
@@ -1262,7 +1248,7 @@ fn loss_and_grad_range_simd(
         let g_rraw = (r_raw.cmp_gt(k(MIN_R)) & r_raw.cmp_lt(k(MAX_R))).blend(g_r, k(0.0));
         let mut gw_g = [f32x8::splat(0.0); 34];
         let (mut g_s, mut g_sf, mut g_d) =
-            curve8_bwd(w, &fc, dts, s, sf, d, g_rraw, f32x8::splat(0.0), &mut gw_g, &wc);
+            curve8_bwd(w, &fc, s, sf, d, g_rraw, f32x8::splat(0.0), &mut gw_g, &wc);
         for t in (0..sl).rev() {
             // O(N^2) path: the only loss is the final curve (handled above), so no per-step adjoint.
             let (gs0, gd0, gsf0) =
@@ -1271,8 +1257,9 @@ fn loss_and_grad_range_simd(
             g_d = gd0;
             g_sf = gsf0;
         }
+        let gg = finish_gw(&gw_g, w, &wc);
         for i in 0..34 {
-            gw[i] += gw_g[i].reduce_add() as f64;
+            gw[i] += gg[i] as f64;
         }
     }
     0.0
@@ -1397,14 +1384,30 @@ pub(crate) fn card_group_grad(
     let g_rraw_last = g_r_loss_at(fc_last.out, weights, labels, lbase);
     // Ungated, like step8_bwd's input adjoints (the previous step's backward applies the mask).
     let (mut g_s, mut g_sf, mut g_d) =
-        curve8_bwd(w, &fc_last, dt_last, s, sf, d, g_rraw_last, z, &mut gw_g, wc);
+        curve8_bwd(w, &fc_last, s, sf, d, g_rraw_last, z, &mut gw_g, wc);
     for (t, cache) in caches.iter().enumerate().skip(1).rev() {
         let g_r_loss = g_r_loss_at(cache.curve_out(), weights, labels, t * batch + c0);
         (g_s, g_d, g_sf) = step8_bwd(w, cache, (g_s, g_d, g_sf), g_r_loss, &mut gw_g, wc);
     }
     // init step (t==0): no prediction (min surviving prefix length is 2).
     step8_bwd(w, &caches[0], (g_s, g_d, g_sf), z, &mut gw_g, wc);
-    std::array::from_fn(|i| gw_g[i].reduce_add())
+    finish_gw(&gw_g, w, wc)
+}
+
+/// Lane sums of a group's gradient bank, with the weight-only factors that the per-step backward
+/// leaves out: slot 27 = sum(g_z) (-> gw[27], gw[28]), slot 26 = sum(x2) and slot 28 = the direct
+/// decay2 term (-> gw[26], gw[24]), slot 25 = sum(g_lw27), slots 10 / 18 = sum(n_ln) per trace.
+fn finish_gw(gw_g: &[f32x8; 34], w: &[f32], wc: &WConsts) -> [f32; 34] {
+    let mut g: [f32; 34] = std::array::from_fn(|i| gw_g[i].reduce_add());
+    let (s_z, s_x2, s_dec2) = (g[27], g[26], g[28]);
+    g[27] = s_z * wc.nrw27;
+    g[28] = s_z * wc.rw28;
+    g[26] = s_x2 * wc.k26;
+    g[24] = if wc.live24 { -(s_dec2 + s_x2 * wc.k24) } else { 0.0 };
+    g[25] *= wc.rw25;
+    g[10] *= 1.0 / w[10];
+    g[18] *= 1.0 / w[18];
+    g
 }
 
 /// Windowed forward-only BCE loss (validation) — `card_loss_and_grad_simd`'s forward without the
