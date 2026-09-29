@@ -1031,22 +1031,20 @@ fn steps_rows(a: &[f32], batch: usize, n: usize) -> std::slice::ChunksExact<'_, 
 /// leaves out: slot 27 = sum(g_z) (-> gw[27], gw[28]), slot 26 = sum(x2) and slot 28 = the direct
 /// decay2 term (-> gw[26], gw[24]), slot 25 = sum(g_lw27), slots 10 / 18 = sum(n_ln) per trace.
 pub(super) fn finish_gw(gw_g: &[F; 34], w: &[f32], wc: &WConsts) -> [f32; 34] {
-    // The lane sums in reduce_add's exact order (per half ((x0 + x1) + x2) + x3, as f32 sum() from
-    // -0.0 gives, then low + high), four slots at a time on transposed halves instead of one slot
-    // at a time through memory.
-    // N = 4 (the 4-lane tail groups, see card_group_grad): one half per slot; the 8-lane sum
-    // would add the empty lanes' exact zeros as the high half.
+    // The lane sums, four slots at a time on transposed halves: ((y0 + y1) + y2) + y3 with
+    // y_i = x_i + x_{i+4} (N = 4, the 4-lane tail groups: y_i = x_i).
     let halves: &[f32x4] = bytemuck::cast_slice(&gw_g[..]);
     let nh = N / 4;
     let mut g = [0.0f32; 34];
     for c in (0..34).step_by(4) {
-        let h = |s: usize, k: usize| if s < 34 { halves[nh * s + k] } else { f32x4::ZERO };
-        let lo = f32x4::transpose([h(c, 0), h(c + 1, 0), h(c + 2, 0), h(c + 3, 0)]);
-        let mut sum = ((lo[0] + lo[1]) + lo[2]) + lo[3];
-        if nh == 2 {
-            let hi = f32x4::transpose([h(c, 1), h(c + 1, 1), h(c + 2, 1), h(c + 3, 1)]);
-            sum += ((hi[0] + hi[1]) + hi[2]) + hi[3];
-        }
+        // Each slot's two halves added first (lane i + lane i + 4), then one transpose.
+        let h = |s: usize| match (s < 34, nh) {
+            (false, _) => f32x4::ZERO,
+            (true, 1) => halves[s],
+            (true, _) => halves[2 * s] + halves[2 * s + 1],
+        };
+        let t = f32x4::transpose([h(c), h(c + 1), h(c + 2), h(c + 3)]);
+        let sum = ((t[0] + t[1]) + t[2]) + t[3];
         for (k, v) in sum.to_array().into_iter().enumerate().take(34 - c) {
             g[c + k] = v;
         }

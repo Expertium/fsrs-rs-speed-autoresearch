@@ -1553,9 +1553,9 @@ fn build_batch_host(chunk: &[WeightedFSRSItem]) -> BatchHost {
 /// becomes ONE column holding its FULL review sequence, taken from its longest surviving prefix
 /// (every shorter prefix is a head of it). A surviving prefix of length L (<= max_seq_len) predicts
 /// review L-1, so its recency weight goes to wts[(L-1)*bsz + c] (label likewise); every other (t, c)
-/// stays weight 0 (a filtered middle prefix, t==0, or padding). Cards are ordered by (full length,
-/// card id) — a total order, so the batches are reproducible and length-similar (less SIMD padding)
-/// — and WHOLE cards are packed into batches of at most `batch_size` predictions, so each Adam step
+/// stays weight 0 (a filtered middle prefix, t==0, or padding). Cards are ordered by full length,
+/// and cards of one length by their first prediction in input order — a total order, so the batches
+/// are reproducible and length-similar (less SIMD padding) — and WHOLE cards are packed into batches of at most `batch_size` predictions, so each Adam step
 /// sees a whole card's predictions together. The plan reads only item headers; `layout` then fills
 /// one batch's arrays (reading each card's longest prefix, clamping delta_t as
 /// normalize_training_set does), so train() can lay out batches on its second thread.
@@ -1569,21 +1569,6 @@ struct CardedPlan {
     bounds: Vec<(usize, usize)>,
     n_items: usize,
     n_preds: usize,
-}
-
-/// The cards' `key`s ordered by full length (`at`: each length's first position), each length's
-/// keys sorted.
-fn by_length<K: Ord + Default + Clone>(cards: &[PlanCard], at: &[usize], key: impl Fn(usize) -> K) -> Vec<K> {
-    let mut keys = vec![K::default(); cards.len()];
-    let mut fill = at.to_vec();
-    for (ci, card) in cards.iter().enumerate() {
-        keys[fill[card.full_len as usize]] = key(ci);
-        fill[card.full_len as usize] += 1;
-    }
-    for l in at.windows(2) {
-        keys[l[0]..l[1]].sort_unstable();
-    }
-    keys
 }
 
 /// 24 bytes, so the per-item updates of `new` stay in cache.
@@ -1612,7 +1597,6 @@ impl CardedPlan {
         let home = |id: i64, bits: u32| ((id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - bits)) as usize;
         let mut cards: Vec<PlanCard> = Vec::with_capacity(n_cards);
         let mut link: Vec<u64> = Vec::with_capacity(items.len());
-        let (mut min_id, mut max_id) = (i64::MAX, i64::MIN);
         let mut n_preds = 0;
         for (idx, (item, &id)) in items.iter().zip(card_ids).enumerate() {
             let len = item.reviews.len();
@@ -1629,7 +1613,6 @@ impl CardedPlan {
             } else {
                 slots[h] = cards.len() as u32;
                 cards.push(PlanCard { id, full_len: 0, longest: 0, n_preds: 0, last: u32::MAX });
-                (min_id, max_id) = (min_id.min(id), max_id.max(id));
                 if cards.len() * 2 > slots.len() {
                     bits += 1;
                     slots = vec![u32::MAX; 1 << bits];
@@ -1654,10 +1637,8 @@ impl CardedPlan {
             link.push((card.last as u64) << 32 | (len - 1) as u64);
             card.last = idx as u32;
         }
-        // Order the cards by (full length, card id), a total order (a card's id is unique): a
-        // counting sort by full length (<= max_seq_len), then each length's cards by id. The id
-        // sort runs on one u64 per card, (id - min id) << bits | card index, when the id span fits
-        // (card ids are millisecond timestamps, so it does), else on (id, index) pairs.
+        // Order the cards by full length, each length's cards in card order (their first
+        // prediction's input order): a stable counting sort by full length (<= max_seq_len).
         let mut at = vec![0usize; max_seq_len + 2];
         for card in &cards {
             at[card.full_len as usize + 1] += 1;
@@ -1665,15 +1646,11 @@ impl CardedPlan {
         for l in 1..at.len() {
             at[l] += at[l - 1];
         }
-        let id = |ci: usize| cards[ci].id;
-        let span = max_id.abs_diff(min_id); // (no cards: then the order is empty either way)
-        let bits = usize::BITS - cards.len().leading_zeros();
-        let order: Vec<usize> = if span >> (64 - bits) == 0 {
-            let keys = by_length(&cards, &at, |ci| id(ci).abs_diff(min_id) << bits | ci as u64);
-            keys.iter().map(|k| (k & ((1 << bits) - 1)) as usize).collect()
-        } else {
-            by_length(&cards, &at, |ci| (id(ci), ci)).iter().map(|k| k.1).collect()
-        };
+        let mut order = vec![0usize; cards.len()];
+        for (ci, card) in cards.iter().enumerate() {
+            order[at[card.full_len as usize]] = ci;
+            at[card.full_len as usize] += 1;
+        }
         let mut bounds = Vec::new();
         let (mut first, mut current_preds) = (0, 0);
         for (k, &ci) in order.iter().enumerate() {
