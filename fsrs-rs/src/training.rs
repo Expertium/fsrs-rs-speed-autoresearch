@@ -1736,6 +1736,9 @@ struct GradShared<'a> {
     w: [AtomicU32; 34],
     done: AtomicUsize,
     out: Vec<[AtomicU32; 34]>,
+    /// The prefix-items, once the helper has laid out every batch: freed a block at a time by a
+    /// thread that would otherwise wait (see free_some).
+    trash: Mutex<Vec<FSRSItem>>,
 }
 
 const JOB_STOP: u64 = u64::MAX;
@@ -1743,20 +1746,24 @@ const JOB_STOP: u64 = u64::MAX;
 /// A thread's reusable per-step cache slots for the 8-lane and the 4-lane kernels.
 type Caches = (Vec<crate::analytic::Step8>, Vec<crate::analytic::k4::Step8>);
 
-/// Drops the prefix-items in blocks: first one independent load from each item's review buffer
-/// (the loads overlap), then the frees, which find the allocation's heap entry in cache. Freeing
-/// straight through waits on one cache miss per item (~100 ns each on a large collection).
-fn free_items(mut items: Vec<FSRSItem>) {
-    for block in items.chunks_mut(128) {
-        let touch = block.iter().fold(0u32, |a, it| a ^ it.reviews.first().map_or(0, |r| r.rating));
-        std::hint::black_box(touch);
-        for it in block {
-            drop(std::mem::take(&mut it.reviews));
-        }
-    }
-}
-
 impl GradShared<'_> {
+    /// Frees one block of the prefix-items (~80 ns each) if any are left and no other thread is
+    /// freeing; returns false if it freed nothing. First one independent load from each item's review
+    /// buffer (the loads overlap), then the frees, which find the allocation's heap entry in cache.
+    /// The threads call it while they wait (the helper for the next job, the main thread for the
+    /// helper's last group), so the frees mostly fill time that was idle.
+    fn free_some(&self) -> bool {
+        let Ok(mut items) = self.trash.try_lock() else {
+            return false;
+        };
+        let len = items.len();
+        let keep = len.saturating_sub(32);
+        let touch = items[keep..].iter().fold(0u32, |a, it| a ^ it.reviews.first().map_or(0, |r| r.rating));
+        std::hint::black_box(touch);
+        items.truncate(keep);
+        keep < len
+    }
+
     /// Claim and compute groups of job `seq` until none is left (or the job changed).
     fn work(&self, seq: u32, w: &[f32], wc: &crate::analytic::WConsts, caches: &mut Caches) {
         let hb = self.host[self.batch.load(Ordering::Relaxed)].get().expect("published batch");
@@ -1798,17 +1805,22 @@ impl GradShared<'_> {
             let _ = self.host[b].set(plan.layout(&items, b, &weight));
         }
         drop((plan, card_ids));
-        free_items(items);
+        *self.trash.lock().unwrap() = items;
         let mut caches = (Vec::new(), Vec::new());
         let mut seen = 0u32;
         loop {
             let v = self.job.load(Ordering::Acquire);
             if v == JOB_STOP {
+                while !self.trash.lock().unwrap().is_empty() {
+                    self.free_some();
+                }
                 return;
             }
             let seq = (v >> 32) as u32;
             if seq == seen {
-                std::hint::spin_loop();
+                if !self.free_some() {
+                    std::hint::spin_loop();
+                }
                 continue;
             }
             seen = seq;
@@ -1913,6 +1925,7 @@ fn train<B: AutodiffBackend>(
         w: std::array::from_fn(|_| AtomicU32::new(0)),
         done: AtomicUsize::new(0),
         out: (0..max_bsz / 8).map(|_| std::array::from_fn(|_| AtomicU32::new(0))).collect(),
+        trash: Mutex::new(Vec::new()),
     };
     let mut caches = (Vec::new(), Vec::new());
     let mut seq = 0u32;
@@ -1989,7 +2002,9 @@ fn train<B: AutodiffBackend>(
                 shared.work(seq, w_vec, &wc, &mut caches);
                 let n = hb.bsz / 8;
                 while shared.done.load(Ordering::Acquire) < n {
-                    std::hint::spin_loop();
+                    if !shared.free_some() {
+                        std::hint::spin_loop();
+                    }
                 }
                 for group in &shared.out[..n] {
                     for (t, o) in total_grad.iter_mut().zip(group) {
@@ -2090,6 +2105,10 @@ fn train<B: AutodiffBackend>(
         info!("epoch: {:?} done", epoch);
     }
     shared.job.store(JOB_STOP, Ordering::Release);
+    // Items left over: freed by both threads.
+    while !shared.trash.lock().unwrap().is_empty() {
+        shared.free_some();
+    }
     });
     // Per-region training timing, silent unless FSRS_PROFILE is set (it printed on
     // every train() call before — clutter + stderr I/O in the timed path). The env

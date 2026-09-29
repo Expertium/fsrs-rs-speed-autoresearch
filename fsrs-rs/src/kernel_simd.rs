@@ -602,61 +602,84 @@ pub(crate) fn batch_loss_simd(
 
 // ===================== SIMD recurrence step (8 cards/lane) with cache =====================
 // Per-timestep cache for the vectorized backward. The first review (t==0) only needs the init
-// override's data (the curve/stab/next_d it computes are dead, overridden), so it gets a small
-// `First` variant; every later step stores the full forward intermediates (`Full`).
-pub(crate) enum Step8 {
-    First {
-        rc: F,
-        init_s: F,
-        ex_w5: F,
-        id_in: F,
-    },
-    Full {
-        s0: F,
-        d0: F,
-        sf0: F,
-        rating: F,
-        curve: Curve8,
-        slow: Stab8,
-        fast: Stab8,
-        nd_out_pre: F,
-        nd_delta_d: F,
-        /// Some lane lapses (rating 1) at this step; else the lapse-only terms are skipped.
-        lapse: bool,
-    },
+// override's data (the curve/stab/next_d it computes are dead, overridden), so it gets its own small
+// First8; every later step stores the full forward intermediates (Step8).
+pub(crate) struct First8 {
+    rc: F,
+    init_s: F,
+    ex_w5: F,
+    id_in: F,
 }
 
-impl Step8 {
-    /// A `Full` slot for step8_fwd_into to fill.
-    pub(crate) fn blank() -> Self {
-        let z = F::splat(0.0);
-        Step8::Full {
-            s0: z, d0: z, sf0: z, rating: z, curve: Curve8::default(), slow: Stab8::default(),
-            fast: Stab8::default(), nd_out_pre: z, nd_delta_d: z, lapse: false,
-        }
-    }
-
-    /// The retrievability the curve predicted at this step (= the loss target R_t in the windowed
-    /// O(N) forward). The first review (t==0) makes no prediction, so it returns 0 (the windowed
-    /// kernels never score t==0; the minimum surviving prefix length is 2).
-    #[inline(always)]
-    fn curve_out(&self) -> F {
-        match self {
-            Step8::Full { curve, .. } => curve.out,
-            Step8::First { .. } => F::splat(0.0),
-        }
-    }
+#[derive(Default)]
+pub(crate) struct Step8 {
+    s0: F,
+    d0: F,
+    sf0: F,
+    rating: F,
+    curve: Curve8,
+    slow: Stab8,
+    fast: Stab8,
+    nd_out_pre: F,
+    nd_delta_d: F,
+    /// Some lane lapses (rating 1) at this step; else the lapse-only terms are skipped.
+    lapse: bool,
 }
 
-/// One recurrence step over 8 cards. `first` (t==0) initialises state from the rating exactly like
-/// batch_loss_simd; otherwise it mirrors step_fwd (curve + both stability traces + next-difficulty,
-/// then the rating==0 padding passthrough). Returns the new state and the backward cache.
+/// The first review (t==0): initialises the state from the rating (mirrors step_fwd's nth0
+/// override, as batch_loss_simd does). It makes no prediction.
+#[inline(always)]
+pub(super) fn first8_fwd<const FAST: bool>(w: &[f32], rating: F) -> ((F, F, F), First8) {
+    let k = F::splat;
+    let one = k(1.0);
+    let rc = clamp8(rating, 1.0, 4.0);
+    let init_s = rc.cmp_eq(one).blend(
+        k(w[0]),
+        rc.cmp_eq(k(2.0)).blend(k(w[1]), rc.cmp_eq(k(3.0)).blend(k(w[2]), k(w[3]))),
+    );
+    let ex_w5 = exp8_in_range::<FAST>(k(w[5]) * (rc - one));
+    let id_in = k(w[4]) - ex_w5 + one;
+    let init_d = clamp8(id_in, D_MIN, D_MAX);
+    let out = (
+        clamp8(init_s, S_MIN, S_MAX),
+        init_d,
+        clamp8(k(0.8) * init_s, S_MIN, S_MAX),
+    );
+    (out, First8 { rc, init_s, ex_w5, id_in })
+}
+
+/// VJP of first8_fwd: the only weight grads are gw[rc-1] (init stability, scattered by the per-lane
+/// rating via 4 masked adds) and gw[4]/gw[5] (init difficulty). The input adjoints are 0 (the state
+/// before the first review is constant 0).
+#[inline(always)]
+pub(super) fn first8_bwd(c: &First8, g_out: (F, F, F), gw: &mut [F; 34]) {
+    let k = F::splat;
+    let one = k(1.0);
+    let z = k(0.0);
+    let (g_ns_out, g_nd_out, g_nsf_out) = g_out;
+    let First8 { rc, init_s, ex_w5, id_in } = c;
+    let g_ns3 = (init_s.cmp_gt(k(S_MIN)) & init_s.cmp_lt(k(S_MAX))).blend(g_ns_out, z);
+    let nsf3 = k(0.8) * *init_s;
+    let g_nsf3 = (nsf3.cmp_gt(k(S_MIN)) & nsf3.cmp_lt(k(S_MAX))).blend(g_nsf_out, z);
+    let g_init_s = g_ns3 + g_nsf3 * k(0.8);
+    gw[0] += rc.cmp_eq(k(1.0)).blend(g_init_s, z);
+    gw[1] += rc.cmp_eq(k(2.0)).blend(g_init_s, z);
+    gw[2] += rc.cmp_eq(k(3.0)).blend(g_init_s, z);
+    gw[3] += rc.cmp_eq(k(4.0)).blend(g_init_s, z);
+    let idmask = id_in.cmp_gt(k(D_MIN)) & id_in.cmp_lt(k(D_MAX));
+    gw[4] += idmask.blend(g_nd_out, z);
+    gw[5] += idmask.blend(g_nd_out * (z - *ex_w5 * (*rc - one)), z);
+}
+
+/// One recurrence step (t >= 1) over 8 cards: mirrors step_fwd (curve + both stability traces +
+/// next-difficulty, then the rating==0 padding passthrough). Returns the new state and the
+/// backward cache.
 #[inline(always)]
 pub(super) fn step8_fwd<const FAST: bool, const PAD: bool>(
-    w: &[f32], dt_raw: F, rating: F, state: (F, F, F), first: bool, wc: &WConsts,
+    w: &[f32], dt_raw: F, rating: F, state: (F, F, F), wc: &WConsts,
 ) -> ((F, F, F), Step8) {
-    let mut c = Step8::blank();
-    let ns = step8_fwd_into::<FAST, PAD>(w, dt_raw, rating, state, first, wc, &mut c);
+    let mut c = Step8::default();
+    let ns = step8_fwd_into::<FAST, PAD>(w, dt_raw, rating, state, wc, &mut c);
     (ns, c)
 }
 
@@ -665,72 +688,46 @@ pub(super) fn step8_fwd<const FAST: bool, const PAD: bool>(
 /// registers and spill slots and copying it at the push. Returns the new state.
 #[inline(always)]
 pub(super) fn step8_fwd_into<const FAST: bool, const PAD: bool>(
-    w: &[f32], dt_raw: F, rating: F, state: (F, F, F), first: bool, wc: &WConsts,
-    slot: &mut Step8,
+    w: &[f32], dt_raw: F, rating: F, state: (F, F, F), wc: &WConsts, slot: &mut Step8,
 ) -> (F, F, F) {
     let k = F::splat;
     let one = k(1.0);
-    let (s0, d0, sf0) = state;
-    if first {
-        let rc = clamp8(rating, 1.0, 4.0);
-        let init_s = rc.cmp_eq(one).blend(
-            k(w[0]),
-            rc.cmp_eq(k(2.0)).blend(k(w[1]), rc.cmp_eq(k(3.0)).blend(k(w[2]), k(w[3]))),
-        );
-        let ex_w5 = exp8_in_range::<FAST>(k(w[5]) * (rc - one));
-        let id_in = k(w[4]) - ex_w5 + one;
-        let init_d = clamp8(id_in, D_MIN, D_MAX);
-        let out = (
-            clamp8(init_s, S_MIN, S_MAX),
-            init_d,
-            clamp8(k(0.8) * init_s, S_MIN, S_MAX),
-        );
-        *slot = Step8::First { rc, init_s, ex_w5, id_in };
-        out
+    // The incoming state is a previous step's output, which is already clamped (the first step
+    // clamps its init values too), so clamping it again would change nothing.
+    let (last_s, last_d, last_sf) = state;
+    let Step8 {
+        s0: c_s0, d0: c_d0, sf0: c_sf0, rating: c_rating, curve, slow, fast, nd_out_pre, nd_delta_d,
+        lapse: c_lapse,
+    } = slot;
+    (*c_s0, *c_d0, *c_sf0, *c_rating) = (last_s, last_d, last_sf, rating);
+    let ln_last_s = log2_8(last_s);
+    let ln_last_sf = log2_8(last_sf);
+    // r1 = short component recall — drives the short-trace update (iter-71)
+    let (r, r1) = curve8_fwd_into::<FAST>(w, dt_raw, last_s, last_sf, last_d, wc, ln_last_s, ln_last_sf, curve);
+    let slow_out = stab8_fwd_into::<FAST>(w, wc, last_s, last_d, r, rating, 7, wc.aa7, ln_last_s, slow);
+    let fast_out = stab8_fwd_into::<FAST>(w, wc, last_sf, last_d, r1, rating, 15, wc.aa16, ln_last_sf, fast);
+    let lapse = rating.cmp_eq(one).any();
+    *c_lapse = lapse;
+    let (nd, pre, dd) = next_d8_fwd(w, last_d, rating, r, wc.init, lapse);
+    (*nd_out_pre, *nd_delta_d) = (pre, dd);
+    // POST-LAPSE short reset (iter-97): on a lapse cap s_short at 0.8 * post-lapse s_long.
+    let nsf_pre = if lapse {
+        rating.cmp_eq(one).blend(fast_out.fast_min(k(0.8) * slow_out), fast_out)
     } else {
-        // The incoming state is a previous step8_fwd output, which is already clamped (the first
-        // step clamps its init values too), so clamping it again would change nothing.
-        let (last_s, last_d, last_sf) = (s0, d0, sf0);
-        if let Step8::First { .. } = slot {
-            *slot = Step8::blank();
-        }
-        let Step8::Full {
-            s0: c_s0, d0: c_d0, sf0: c_sf0, rating: c_rating, curve, slow, fast, nd_out_pre, nd_delta_d,
-            lapse: c_lapse,
-        } = slot
-        else {
-            unreachable!()
-        };
-        (*c_s0, *c_d0, *c_sf0, *c_rating) = (s0, d0, sf0, rating);
-        let ln_last_s = log2_8(last_s);
-        let ln_last_sf = log2_8(last_sf);
-        // r1 = short component recall — drives the short-trace update (iter-71)
-        let (r, r1) = curve8_fwd_into::<FAST>(w, dt_raw, last_s, last_sf, last_d, wc, ln_last_s, ln_last_sf, curve);
-        let slow_out = stab8_fwd_into::<FAST>(w, wc, last_s, last_d, r, rating, 7, wc.aa7, ln_last_s, slow);
-        let fast_out = stab8_fwd_into::<FAST>(w, wc, last_sf, last_d, r1, rating, 15, wc.aa16, ln_last_sf, fast);
-        let lapse = rating.cmp_eq(one).any();
-        *c_lapse = lapse;
-        let (nd, pre, dd) = next_d8_fwd(w, last_d, rating, r, wc.init, lapse);
-        (*nd_out_pre, *nd_delta_d) = (pre, dd);
-        // POST-LAPSE short reset (iter-97): on a lapse cap s_short at 0.8 * post-lapse s_long.
-        let nsf_pre = if lapse {
-            rating.cmp_eq(one).blend(fast_out.fast_min(k(0.8) * slow_out), fast_out)
-        } else {
-            fast_out
-        };
-        // PAD: rating==0 (padding) passes the input state through unchanged. Needed where a state is
-        // read AFTER trailing padding (the O(N^2) paths score the final state). The windowed path
-        // (PAD = false) never does: a card's padding only trails it, carries weight 0, and lanes are
-        // independent, so padding lanes may evolve (their values stay finite: rating 0 takes the
-        // clamped post-lapse branch) and contribute only zero gradients.
-        let (ns3, nsf3, nd3) = if PAD {
-            let m0 = rating.cmp_eq(k(0.0));
-            (m0.blend(last_s, slow_out), m0.blend(last_sf, nsf_pre), m0.blend(last_d, nd))
-        } else {
-            (slow_out, nsf_pre, nd)
-        };
-        (clamp8(ns3, S_MIN, S_MAX), nd3, clamp8(nsf3, S_MIN, S_MAX))
-    }
+        fast_out
+    };
+    // PAD: rating==0 (padding) passes the input state through unchanged. Needed where a state is
+    // read AFTER trailing padding (the O(N^2) paths score the final state). The windowed path
+    // (PAD = false) never does: a card's padding only trails it, carries weight 0, and lanes are
+    // independent, so padding lanes may evolve (their values stay finite: rating 0 takes the
+    // clamped post-lapse branch) and contribute only zero gradients.
+    let (ns3, nsf3, nd3) = if PAD {
+        let m0 = rating.cmp_eq(k(0.0));
+        (m0.blend(last_s, slow_out), m0.blend(last_sf, nsf_pre), m0.blend(last_d, nd))
+    } else {
+        (slow_out, nsf_pre, nd)
+    };
+    (clamp8(ns3, S_MIN, S_MAX), nd3, clamp8(nsf3, S_MIN, S_MAX))
 }
 
 /// VJP of one step (F analogue of step_bwd). Given output-state adjoints, returns input-state
@@ -738,7 +735,7 @@ pub(super) fn step8_fwd_into<const FAST: bool, const PAD: bool>(
 /// scored directly off this step's curve.out (nonzero only in the windowed O(N) forward, where every
 /// step emits a prediction); it is added to the two stab r-adjoints before curve8_bwd, since curve.out
 /// feeds the loss AND both stability traces. The O(N^2) callers pass 0 (their loss is the separate
-/// final curve). The First variant ignores it (t==0 makes no prediction).
+/// final curve). t >= 1 only (first8_bwd is the t==0 step).
 #[inline(always)]
 pub(super) fn step8_bwd<const PAD: bool>(
     w: &[f32], c: &Step8, g_out: (F, F, F), g_r_loss: F, gw: &mut [F; 34], wc: &WConsts,
@@ -747,95 +744,73 @@ pub(super) fn step8_bwd<const PAD: bool>(
     let one = k(1.0);
     let z = k(0.0);
     let (g_ns_out, g_nd_out, g_nsf_out) = g_out;
-    match c {
-        // t==0 init override: the only weight grads are gw[rc-1] (init stability, scattered by the
-        // per-lane rating via 4 masked adds) and gw[4]/gw[5] (init difficulty). Input adjoints are 0
-        // (state before the first review is constant 0).
-        Step8::First { rc, init_s, ex_w5, id_in } => {
-            let g_ns3 = (init_s.cmp_gt(k(S_MIN)) & init_s.cmp_lt(k(S_MAX))).blend(g_ns_out, z);
-            let nsf3 = k(0.8) * *init_s;
-            let g_nsf3 = (nsf3.cmp_gt(k(S_MIN)) & nsf3.cmp_lt(k(S_MAX))).blend(g_nsf_out, z);
-            let g_init_s = g_ns3 + g_nsf3 * k(0.8);
-            gw[0] += rc.cmp_eq(k(1.0)).blend(g_init_s, z);
-            gw[1] += rc.cmp_eq(k(2.0)).blend(g_init_s, z);
-            gw[2] += rc.cmp_eq(k(3.0)).blend(g_init_s, z);
-            gw[3] += rc.cmp_eq(k(4.0)).blend(g_init_s, z);
-            let idmask = id_in.cmp_gt(k(D_MIN)) & id_in.cmp_lt(k(D_MAX));
-            gw[4] += idmask.blend(g_nd_out, z);
-            gw[5] += idmask.blend(g_nd_out * (z - *ex_w5 * (*rc - one)), z);
-            (z, z, z)
-        }
-        Step8::Full {
-            s0, d0, sf0, rating, curve, slow, fast, nd_out_pre, nd_delta_d, lapse,
-        } => {
-            // Cheap forward values recomputed with step8_fwd's exact ops (smaller per-step cache).
-            let (last_s, last_d, last_sf) = (*s0, *d0, *sf0); // already clamped (see step8_fwd)
-            let nsf_pre = if *lapse {
-                rating.cmp_eq(one).blend(fast.out.fast_min(k(0.8) * slow.out), fast.out)
-            } else {
-                fast.out
-            };
-            // PAD: rating==0 padding passes the state through (output == input), so its adjoint
-            // flows straight through (see step8_fwd; the windowed path does not need this).
-            let m0 = rating.cmp_eq(z);
-            let (ns3, nsf3) = if PAD {
-                (m0.blend(last_s, slow.out), m0.blend(last_sf, nsf_pre))
-            } else {
-                (slow.out, nsf_pre)
-            };
-            let g_ns3 = (ns3.cmp_gt(k(S_MIN)) & ns3.cmp_lt(k(S_MAX))).blend(g_ns_out, z);
-            let g_nsf3 = (nsf3.cmp_gt(k(S_MIN)) & nsf3.cmp_lt(k(S_MAX))).blend(g_nsf_out, z);
-            let g_nd3 = g_nd_out;
-            let (g_ns2, g_nsf2, g_nd2) = if PAD {
-                (m0.blend(z, g_ns3), m0.blend(z, g_nsf3), m0.blend(z, g_nd3))
-            } else {
-                (g_ns3, g_nsf3, g_nd3)
-            };
-            // POST-LAPSE min routing: nsf_pre = (rating==1)? min(fast.out, 0.8*slow.out) : fast.out.
-            let (g_fast_out, g_slow_from_relearn) = if *lapse {
-                let is_lapse = rating.cmp_eq(one);
-                let fast_wins = fast.out.cmp_le(k(0.8) * slow.out);
-                (
-                    is_lapse.blend(fast_wins.blend(g_nsf2, z), g_nsf2),
-                    is_lapse.blend(fast_wins.blend(z, g_nsf2 * k(0.8)), z),
-                )
-            } else {
-                (g_nsf2, z)
-            };
-            // LONG stab reads mixed retention curve.out; SHORT stab reads r1=curve.r1 (start 15).
-            let (g_ls_a, g_ld_a, g_r_long) =
-                stab8_bwd(
-                    w, slow, last_s, curve.out, *rating, 7, wc.aa7, curve.ln_s,
-                    g_ns2 + g_slow_from_relearn, gw,
-                );
-            let g_r_curve = g_r_long + g_r_loss;
-            let (g_lsf_b, g_ld_b, g_r1_short) =
-                stab8_bwd(
-                    w, fast, last_sf, curve.r1, *rating, 15, wc.aa16, curve.ln_sf, g_fast_out,
-                    gw,
-                );
-            let g_ld_ab = g_ld_a + g_ld_b;
-            let (g_ld_c, g_r_nextd) =
-                next_d8_bwd(w, *nd_out_pre, *nd_delta_d, last_d, *rating, curve.out, g_nd2, gw, wc.exp3w5, *lapse);
-            // curve.out adjoint = long-stab r + windowed loss adjoint + next_d r; curve.r1 = short-stab r.
-            // The input-state adjoints: g_last_s = g_ls_a + g_ls_d, g_last_sf = g_lsf_b + g_lsf_d and
-            // g_last_d = ((g_ld_a + g_ld_b) + g_ld_c) + g_ld_d, summed inside curve8_bwd_acc.
-            let (mut g_last_s, mut g_last_sf, mut g_last_d) = curve8_bwd_acc::<true>(
-                w, curve, last_s, last_sf, last_d, g_r_curve + g_r_nextd, g_r1_short,
-                gw, wc, (g_ls_a, g_lsf_b, g_ld_ab + g_ld_c),
-            );
-            if PAD {
-                g_last_s += m0.blend(g_ns3, z);
-                g_last_sf += m0.blend(g_nsf3, z);
-                g_last_d += m0.blend(g_nd3, z);
-            }
-            // No clamp gate here: s0/d0/sf0 are the previous step's clamped outputs, and that step's
-            // backward applies the same mask to this adjoint (S_MIN < x < S_MAX holds for the
-            // clamped value exactly when it holds for the unclamped one; a padding passthrough
-            // carries a zero adjoint), so gating here too would change nothing.
-            (g_last_s, g_last_d, g_last_sf)
-        }
+    let Step8 { s0, d0, sf0, rating, curve, slow, fast, nd_out_pre, nd_delta_d, lapse } = c;
+    // Cheap forward values recomputed with step8_fwd's exact ops (smaller per-step cache).
+    let (last_s, last_d, last_sf) = (*s0, *d0, *sf0); // already clamped (see step8_fwd)
+    let nsf_pre = if *lapse {
+        rating.cmp_eq(one).blend(fast.out.fast_min(k(0.8) * slow.out), fast.out)
+    } else {
+        fast.out
+    };
+    // PAD: rating==0 padding passes the state through (output == input), so its adjoint
+    // flows straight through (see step8_fwd; the windowed path does not need this).
+    let m0 = rating.cmp_eq(z);
+    let (ns3, nsf3) = if PAD {
+        (m0.blend(last_s, slow.out), m0.blend(last_sf, nsf_pre))
+    } else {
+        (slow.out, nsf_pre)
+    };
+    let g_ns3 = (ns3.cmp_gt(k(S_MIN)) & ns3.cmp_lt(k(S_MAX))).blend(g_ns_out, z);
+    let g_nsf3 = (nsf3.cmp_gt(k(S_MIN)) & nsf3.cmp_lt(k(S_MAX))).blend(g_nsf_out, z);
+    let g_nd3 = g_nd_out;
+    let (g_ns2, g_nsf2, g_nd2) = if PAD {
+        (m0.blend(z, g_ns3), m0.blend(z, g_nsf3), m0.blend(z, g_nd3))
+    } else {
+        (g_ns3, g_nsf3, g_nd3)
+    };
+    // POST-LAPSE min routing: nsf_pre = (rating==1)? min(fast.out, 0.8*slow.out) : fast.out.
+    let (g_fast_out, g_slow_from_relearn) = if *lapse {
+        let is_lapse = rating.cmp_eq(one);
+        let fast_wins = fast.out.cmp_le(k(0.8) * slow.out);
+        (
+            is_lapse.blend(fast_wins.blend(g_nsf2, z), g_nsf2),
+            is_lapse.blend(fast_wins.blend(z, g_nsf2 * k(0.8)), z),
+        )
+    } else {
+        (g_nsf2, z)
+    };
+    // LONG stab reads mixed retention curve.out; SHORT stab reads r1=curve.r1 (start 15).
+    let (g_ls_a, g_ld_a, g_r_long) =
+        stab8_bwd(
+            w, slow, last_s, curve.out, *rating, 7, wc.aa7, curve.ln_s,
+            g_ns2 + g_slow_from_relearn, gw,
+        );
+    let g_r_curve = g_r_long + g_r_loss;
+    let (g_lsf_b, g_ld_b, g_r1_short) =
+        stab8_bwd(
+            w, fast, last_sf, curve.r1, *rating, 15, wc.aa16, curve.ln_sf, g_fast_out,
+            gw,
+        );
+    let g_ld_ab = g_ld_a + g_ld_b;
+    let (g_ld_c, g_r_nextd) =
+        next_d8_bwd(w, *nd_out_pre, *nd_delta_d, last_d, *rating, curve.out, g_nd2, gw, wc.exp3w5, *lapse);
+    // curve.out adjoint = long-stab r + windowed loss adjoint + next_d r; curve.r1 = short-stab r.
+    // The input-state adjoints: g_last_s = g_ls_a + g_ls_d, g_last_sf = g_lsf_b + g_lsf_d and
+    // g_last_d = ((g_ld_a + g_ld_b) + g_ld_c) + g_ld_d, summed inside curve8_bwd_acc.
+    let (mut g_last_s, mut g_last_sf, mut g_last_d) = curve8_bwd_acc::<true>(
+        w, curve, last_s, last_sf, last_d, g_r_curve + g_r_nextd, g_r1_short,
+        gw, wc, (g_ls_a, g_lsf_b, g_ld_ab + g_ld_c),
+    );
+    if PAD {
+        g_last_s += m0.blend(g_ns3, z);
+        g_last_sf += m0.blend(g_nsf3, z);
+        g_last_d += m0.blend(g_nd3, z);
     }
+    // No clamp gate here: s0/d0/sf0 are the previous step's clamped outputs, and that step's
+    // backward applies the same mask to this adjoint (S_MIN < x < S_MAX holds for the
+    // clamped value exactly when it holds for the unclamped one; a padding passthrough
+    // carries a zero adjoint), so gating here too would change nothing.
+    (g_last_s, g_last_d, g_last_sf)
 }
 
 /// Vectorized forward + reverse-mode backward over card groups `[g_start, g_end)` (8 cards/lane).
@@ -869,15 +844,11 @@ pub(super) fn loss_and_grad_range_simd(
         while sl > 1 && load8(r_hist, (sl - 1) * batch + c0).reduce_add() == 0.0 {
             sl -= 1;
         }
-        let (mut s, mut d, mut sf) = (k(0.0), k(0.0), k(0.0));
-        for t in 0..sl {
+        let ((mut s, mut d, mut sf), first) = first8_fwd::<false>(w, load8(r_hist, c0));
+        for t in 1..sl {
             let base = t * batch + c0;
-            let rating = load8(r_hist, base);
-            let dt = if t == 0 { k(0.0) } else { load8(t_hist, base) };
-            let (ns, cache) = step8_fwd::<false, true>(w, dt, rating, (s, d, sf), t == 0, &wc);
-            s = ns.0;
-            d = ns.1;
-            sf = ns.2;
+            let (ns, cache) = step8_fwd::<false, true>(w, load8(t_hist, base), load8(r_hist, base), (s, d, sf), &wc);
+            (s, d, sf) = ns;
             caches.push(cache);
         }
         let dts = load8(delta_ts, c0);
@@ -895,14 +866,11 @@ pub(super) fn loss_and_grad_range_simd(
         let mut gw_g = [F::splat(0.0); 34];
         let (mut g_s, mut g_sf, mut g_d) =
             curve8_bwd(w, &fc, s, sf, d, g_rraw, F::splat(0.0), &mut gw_g, &wc);
-        for t in (0..sl).rev() {
+        for cache in caches.iter().rev() {
             // O(N^2) path: the only loss is the final curve (handled above), so no per-step adjoint.
-            let (gs0, gd0, gsf0) =
-                step8_bwd::<true>(w, &caches[t], (g_s, g_d, g_sf), F::splat(0.0), &mut gw_g, &wc);
-            g_s = gs0;
-            g_d = gd0;
-            g_sf = gsf0;
+            (g_s, g_d, g_sf) = step8_bwd::<true>(w, cache, (g_s, g_d, g_sf), F::splat(0.0), &mut gw_g, &wc);
         }
+        first8_bwd(&first, (g_s, g_d, g_sf), &mut gw_g);
         let gg = finish_gw(&gw_g, w, &wc);
         for i in 0..34 {
             gw[i] += gg[i] as f64;
@@ -1005,22 +973,20 @@ pub(crate) fn card_group_grad(
     while seq_len > 2 && load8(r_hist, (seq_len - 1) * batch + c0).reduce_add() == 0.0 {
         seq_len -= 1;
     }
-    let (mut s, mut d, mut sf) = (z, z, z);
     // Forward over every step EXCEPT the last (full step + cache). The last step's stability/
     // next-difficulty update feeds no t+1, so we compute its curve only (just below) — exactly
-    // like card_loss_simd's validation skip-last. The first review (t==0) is peeled off, so the
-    // loop body has no t==0 branch. The cache slots are reused across groups (only the first
-    // seq_len - 1 are this group's).
-    let n_cached = seq_len - 1;
+    // like card_loss_simd's validation skip-last. The first review (t==0) is peeled off (First8),
+    // so caches[t - 1] is step t's. The cache slots are reused across groups (only the first
+    // seq_len - 2 are this group's).
+    let n_cached = seq_len - 2;
     while caches.len() < n_cached {
-        caches.push(Step8::blank());
+        caches.push(Step8::default());
     }
     let caches = &mut caches[..n_cached];
-    (s, d, sf) = step8_fwd_into::<false, false>(w, z, load8(r_hist, c0), (s, d, sf), true, wc, &mut caches[0]);
-    for (t, slot) in caches.iter_mut().enumerate().skip(1) {
+    let ((mut s, mut d, mut sf), first) = first8_fwd::<false>(w, load8(r_hist, c0));
+    for (t, slot) in (1..).zip(caches.iter_mut()) {
         let base = t * batch + c0;
-        (s, d, sf) =
-            step8_fwd_into::<false, false>(w, load8(t_hist, base), load8(r_hist, base), (s, d, sf), false, wc, slot);
+        (s, d, sf) = step8_fwd_into::<false, false>(w, load8(t_hist, base), load8(r_hist, base), (s, d, sf), wc, slot);
     }
     // Last step (t = seq_len-1, always >= 1): curve ONLY, from the incoming state (step8_fwd
     // outputs are already clamped) — the exact curve step8_fwd would compute.
@@ -1035,12 +1001,12 @@ pub(crate) fn card_group_grad(
     // Ungated, like step8_bwd's input adjoints (the previous step's backward applies the mask).
     let (mut g_s, mut g_sf, mut g_d) =
         curve8_bwd(w, &fc_last, s, sf, d, g_rraw_last, z, &mut gw_g, wc);
-    for (t, cache) in caches.iter().enumerate().skip(1).rev() {
-        let g_r_loss = g_r_loss_at(cache.curve_out(), weights, labels, t * batch + c0);
+    for (t, cache) in caches.iter().enumerate().rev() {
+        let g_r_loss = g_r_loss_at(cache.curve.out, weights, labels, (t + 1) * batch + c0);
         (g_s, g_d, g_sf) = step8_bwd::<false>(w, cache, (g_s, g_d, g_sf), g_r_loss, &mut gw_g, wc);
     }
     // init step (t==0): no prediction (min surviving prefix length is 2).
-    step8_bwd::<false>(w, &caches[0], (g_s, g_d, g_sf), z, &mut gw_g, wc);
+    first8_bwd(&first, (g_s, g_d, g_sf), &mut gw_g);
     finish_gw(&gw_g, w, wc)
 }
 
@@ -1118,12 +1084,13 @@ pub(crate) fn card_loss_simd(
                     .out,
                     MIN_R, MAX_R,
                 )
+            } else if t == 0 {
+                (s, d, sf) = first8_fwd::<false>(w, rating).0;
+                z // t==0 makes no prediction (unused below)
             } else {
-                let (ns, cache) = step8_fwd::<false, true>(w, dt, rating, (s, d, sf), t == 0, &wc);
-                s = ns.0;
-                d = ns.1;
-                sf = ns.2;
-                clamp8(cache.curve_out(), MIN_R, MAX_R)
+                let (ns, cache) = step8_fwd::<false, true>(w, dt, rating, (s, d, sf), &wc);
+                (s, d, sf) = ns;
+                clamp8(cache.curve.out, MIN_R, MAX_R)
             };
             if t >= 1 {
                 // Per-prediction BCE via the unified identity  -ln(1 - |label - r|)  (= -ln(r) for

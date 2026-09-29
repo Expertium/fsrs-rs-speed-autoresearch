@@ -54,6 +54,7 @@ Accept metric: **median per-user speed_ratio ≥ 1.05** (constraint 12) AND **sp
 | 47 | 7 | 7 | 1.051 | 11169 | 11258 | 1.008 | 1.020 | ✓ | accepted | iter46 stack plus: no padding mask on lapse-free steps, leaner plan, transposed lane sums |
 | 48 | 7 | 6 | 1.006 | 11258 | 11317 | 1.005 | 1.013 | ✓ | rejected | Batch's last card group with at most 4 cards runs on a 4-lane kernel |
 | 49 | 7 | 7 | 1.018 | 11258 | 11317 | 1.005 | 1.013 | ✓ | rejected | iter48 plus stab backward and curve forward reordered so values die early |
+| 50 | 7 | 6 | 1.036 | 11258 | 11304 | 1.004 | 1.010 | ✓ | rejected | iter49 plus items freed in idle waits and first step in its own struct |
 
 **Cumulative speed_ratio (product of accepted): ×354.263** — upward-biased (winner's curse); anchor periodically vs iter-0 baseline.
 
