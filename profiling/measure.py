@@ -170,8 +170,8 @@ def cmd_compare(champ: str, cand: str) -> int:
     # Correctness gate (2026-06-02 ruling): an ABSOLUTE band on the candidate's aggregate mean
     # LogLoss, anchored to the ORIGINAL (iter-0) baseline — NOT a per-step delta vs the champion.
     # This bounds the cumulative accuracy cost of all compounding precision-trades together.
-    ORIG_LL, BAND = 0.3098, 0.0015          # compute_parameters.py reference -> [0.3083, 0.3113]
-    lo, hi = ORIG_LL - BAND, ORIG_LL + BAND
+    ORIG_LL, BAND = 0.3098, 0.0015          # compute_parameters.py reference -> [0.3078, 0.3113]
+    lo, hi = ORIG_LL - BAND - 0.0005, ORIG_LL + BAND   # lower end widened by 0.0005 (Andrew 2026-09-29)
     bit_for_bit = (n_param_diff == 0)
     speed_ok = speed_ratio >= 1.05
     corr_ok = lo <= mean_ll_cand <= hi

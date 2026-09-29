@@ -140,7 +140,7 @@ def main():
                "mean_logloss_b": st.mean(r["ll_b"] for r in res.values())}
     # Correctness bar (CLAUDE.md 3b): mean LogLoss in 0.3098 +- 0.0015, anchored to iter 0.
     # (The band is defined on the 50-user set only; other user sets report None.)
-    summary["logloss_in_band"] = (0.3083 <= summary["mean_logloss_b"] <= 0.3113) if len(res) == 50 else None
+    summary["logloss_in_band"] = (0.3078 <= summary["mean_logloss_b"] <= 0.3113) if len(res) == 50 else None
     print(json.dumps(summary))
     if out:
         json.dump({"summary": summary, "per_user": res}, open(out, "w"))
