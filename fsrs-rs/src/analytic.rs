@@ -688,6 +688,10 @@ struct Curve8 {
     q1: f32x8,
     e1: f32x8,
     p35: f32x8,
+    m1: f32x8,
+    decay1: f32x8,
+    factor1: f32x8,
+    b1: f32x8,
     b2: f32x8,
     r2: f32x8,
     sig: f32x8,
@@ -732,14 +736,18 @@ fn curve8_fwd_into<const FAST: bool>(
     let p35 = exp2_8_in_range::<FAST>((sp(33) - k(0.3)) * ln_sf); // ln_sf, ln_s are log2
     c.p35 = p35;
     let m1 = sp(23) * p35;
+    c.m1 = m1;
     let dm1 = clamp8(m1, 0.01, 0.95);
     let decay1 = k(0.0) - dm1;
+    c.decay1 = decay1;
     let q1 = k(wc.ln_w27) / decay1;
     c.q1 = q1;
     let e1 = exp8_in_range::<FAST>(q1.fast_min(k(60.0)));
     c.e1 = e1;
     let factor1 = e1 - k(1.0);
+    c.factor1 = factor1;
     let b1 = a * factor1 + k(1.0);
+    c.b1 = b1;
     let ln_b1 = log2_8(b1);
     c.ln_b1 = ln_b1;
     let r1 = exp2_8_in_range::<FAST>(decay1 * ln_b1);
@@ -781,14 +789,23 @@ fn curve8_bwd(
     w: &[f32], c: &Curve8, s: f32x8, sf: f32x8, d: f32x8, g_out: f32x8, g_r1_extra: f32x8,
     gw: &mut [f32x8; 34], wc: &WConsts,
 ) -> (f32x8, f32x8, f32x8) {
+    let z = f32x8::splat(0.0);
+    curve8_bwd_acc::<false>(w, c, s, sf, d, g_out, g_r1_extra, gw, wc, (z, z, z))
+}
+
+/// curve8_bwd; with ACC, returns (acc.0 + g_s, acc.1 + g_sf, acc.2 + g_d) instead, each sum formed
+/// as soon as its curve term is known. The code is ordered so values die early: the kernel's basic
+/// blocks are far longer than LLVM's scheduling window, so the source order decides how many
+/// values are live (and spilled) at once.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn curve8_bwd_acc<const ACC: bool>(
+    w: &[f32], c: &Curve8, s: f32x8, sf: f32x8, d: f32x8, g_out: f32x8, g_r1_extra: f32x8,
+    gw: &mut [f32x8; 34], wc: &WConsts, acc: (f32x8, f32x8, f32x8),
+) -> (f32x8, f32x8, f32x8) {
     let sp = |i: usize| f32x8::splat(w[i]);
     let k = f32x8::splat;
     let z = k(0.0);
-    // Cheap forward values recomputed with curve8_fwd's exact ops (smaller per-step cache).
-    let m1 = sp(23) * c.p35;
-    let decay1 = k(0.0) - clamp8(m1, 0.01, 0.95);
-    let factor1 = c.e1 - k(1.0);
-    let b1 = c.a * factor1 + k(1.0);
     let g_ret = g_out * k(1.0 - 2e-5);
     // ret = r1*(1-sig) + r2*sig. r1 also feeds the short-trace stability update (reads r1, not
     // mixed R) -> g_r1_extra.
@@ -802,35 +819,43 @@ fn curve8_bwd(
     gw[30] += g_z * c.ln_s;
     gw[31] += g_z * (d - k(5.0));
     let mut g_d = g_z * (sp(31) - k(0.5));
+    let gz30 = g_z * sp(30); // the ln(s) and ln(sf) terms of g_s / g_sf (below)
+    let gz29 = g_z * sp(29);
     // r2 = b2^decay2, b2 = q2 + 1 with q2 = (t/s)*factor2*ex34 (ex34 = exp((d-5)*(d_decay-0.3)),
     // factor2 = p28 - 1, p28 = base2[w26]^(1/decay2), decay2 = -clamp(w24)). q2 is a product, so
     // the adjoints of ln(t/s), ln(ex34) and ln(factor2) are all x2 = g_b2*q2.
     let v2 = g_r2 * c.r2; // adjoint of ln(r2) = decay2 * ln(b2)
+    // w26 and w24 enter r2 only through weight-only factors: slot 26 holds sum(x2), slot 28 the
+    // direct decay2 term; finish_gw forms gw[26] and gw[24] from them.
+    gw[28] += v2 * c.ln_b2;
     let x2 = v2 * wc.decay2 / c.b2 * c.q2;
     g_d += x2 * (sp(32) - k(0.3));
     gw[32] += x2 * (d - k(5.0));
-    // w26 and w24 enter r2 only through weight-only factors: slot 26 holds sum(x2), slot 28 the
-    // direct decay2 term; finish_gw forms gw[26] and gw[24] from them.
     gw[26] += x2;
-    gw[28] += v2 * c.ln_b2;
+    // d/ds of every ln(s) term, over ONE division.
+    let g_s = (gz30 - x2) / s;
+    let g_s = if ACC { acc.0 + g_s } else { g_s };
+    let g_d = if ACC { acc.2 + g_d } else { g_d };
     // r1 = b1^decay1, b1 = a*factor1 + 1, a = t/sf, factor1 = e1 - 1, e1 = exp(min(q1, 60)),
     // q1 = ln(base1[w25]) / decay1, decay1 = -clamp(w23 * p35), p35 = sf^(s_decay1[w33]-0.3).
+    let decay1 = c.decay1;
     let v1 = g_r1 * c.r1; // adjoint of ln(r1) = decay1 * ln(b1)
     let mut g_decay1 = v1 * c.ln_b1 * k(LN2); // ln(b1) = log2(b1) * ln2
-    let g_b1_a = v1 * decay1 / b1 * c.a; // adjoint of b1, times a
-    let g_a_a = g_b1_a * factor1; // adjoint of ln(a)
+    let g_b1_a = v1 * decay1 / c.b1 * c.a; // adjoint of b1, times a
+    let g_a_a = g_b1_a * c.factor1; // adjoint of ln(a)
     let g_q1 = c.q1.cmp_lt(k(60.0)).blend(g_b1_a * c.e1, z);
     let g_lw27 = g_q1 / decay1;
     g_decay1 -= g_lw27 * c.q1; // d(q1)/d(decay1) = -q1/decay1
     gw[25] += g_lw27; // ln_base1 = ln(w[25]); finish_gw applies 1/w25
+    let m1 = c.m1;
     let g_m1 = (m1.cmp_gt(k(0.01)) & m1.cmp_lt(k(0.95))).blend(z - g_decay1, z);
     let u = g_m1 * c.p35;
     gw[23] += u;
     let y = u * sp(23); // adjoint of ln(p35)
     gw[33] += y * c.ln_sf;
-    // d/ds and d/dsf of every ln(s)/ln(sf) term, over ONE division each.
-    let g_s = (g_z * sp(30) - x2) / s;
-    let g_sf = (g_z * sp(29) + y * (sp(33) - k(0.3)) - g_a_a) / sf;
+    // d/dsf of every ln(sf) term, over ONE division.
+    let g_sf = (gz29 + y * (sp(33) - k(0.3)) - g_a_a) / sf;
+    let g_sf = if ACC { acc.1 + g_sf } else { g_sf };
     (g_s, g_sf, g_d)
 }
 
@@ -851,6 +876,11 @@ struct Stab8 {
     sinc: f32x8,
     cc: f32x8,
     expr: f32x8,
+    /// hard_easy8, expr - 1, aa * bb * cc and aa * bb * cc * (expr - 1): partial products of sinc.
+    he: f32x8,
+    em1: f32x8,
+    abc: f32x8,
+    base: f32x8,
     pr: f32x8,
     qbase: f32x8,
     ln_ls1: f32x8,
@@ -871,13 +901,19 @@ fn stab8_fwd_into<const FAST: bool>(
     let k = f32x8::splat;
     let one = k(1.0);
     let he = hard_easy8(w, rating, start);
+    c.he = he;
     let bb = k(11.0) - last_d;
     let cc = exp2_8_in_range::<FAST>(k(-w[start + 1]) * ln_ls);
     c.cc = cc;
     let expr = exp2_8_in_range::<FAST>((one - r) * k(wc.l2e[start + 2]));
     c.expr = expr;
-    let aa8 = k(aa);
-    let sinc = aa8 * bb * cc * (expr - one) * he + one;
+    let em1 = expr - one;
+    c.em1 = em1;
+    let abc = k(aa) * bb * cc;
+    c.abc = abc;
+    let base = abc * em1;
+    c.base = base;
+    let sinc = base * he + one; // = aa * bb * cc * (expr - 1) * he + 1
     c.sinc = sinc;
     let ls_sinc = last_s * sinc;
     // sinc >= 1, so ls_sinc >= last_s >= pls = min(last_s, nsf_fail): on a success lane the new
@@ -911,17 +947,16 @@ fn stab8_fwd_into<const FAST: bool>(
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn stab8_bwd(
-    w: &[f32], c: &Stab8, last_s: f32x8, last_d: f32x8, r: f32x8, rating: f32x8, start: usize,
+    w: &[f32], c: &Stab8, last_s: f32x8, r: f32x8, rating: f32x8, start: usize,
     aa: f32, ln_ls: f32x8, g_out: f32x8, gw: &mut [f32x8; 34],
 ) -> (f32x8, f32x8, f32x8) {
     let sp = |i: usize| f32x8::splat(w[i]);
     let k = f32x8::splat;
     let one = k(1.0);
     let z = k(0.0);
-    // aa / hard / easy / ln_ls are recomputed or passed in (not cached): the same values stab8_fwd_into used.
+    // aa / ln_ls are passed in (not cached): the same values stab8_fwd_into used.
     let aa = k(aa);
-    let he = hard_easy8(w, rating, start);
-    let bb = k(11.0) - last_d;
+    let he = c.he;
     let gt1 = rating.cmp_gt(one);
     let g_nss = gt1.blend(g_out, z);
     // Without the post-lapse branch (see stab8_fwd_into) every success lane routes to ls_sinc, and the
@@ -943,9 +978,9 @@ fn stab8_bwd(
     g_last_s += g_ls_sinc * c.sinc;
     let g_sinc = g_ls_sinc * last_s;
     // sinc = aa*bb*cc*(expr-1)*hard*easy + 1
-    let em1 = c.expr - one;
+    let em1 = c.em1;
     let g_prod = g_sinc;
-    let base = aa * bb * c.cc * em1;
+    let base = c.base;
     // d(prod)/d(hard_penalty) on rating-2 lanes and d(prod)/d(easy_bonus) on rating-4 lanes are
     // both `base` (the other factor is exactly 1 there).
     let g_base = g_prod * base;
@@ -954,7 +989,7 @@ fn stab8_bwd(
     gw[start] += p_ln; // aa = exp(w[start]-1.5)
     let g_he = g_prod * he;
     let g_bb = g_he * (aa * c.cc * em1);
-    let g_em1 = g_he * (aa * bb * c.cc);
+    let g_em1 = g_he * c.abc;
     gw[start + 6] += rating.cmp_eq(k(2.0)).blend(g_base, z); // hard_penalty
     gw[start + 7] += rating.cmp_eq(k(4.0)).blend(g_base, z); // easy_bonus
     let g_last_d = g_bb * (z - one); // bb = 11 - last_d (the ONLY D-dependence of stab now)
@@ -1328,24 +1363,25 @@ fn step8_bwd<const PAD: bool>(
             // LONG stab reads mixed retention curve.out; SHORT stab reads r1=curve.r1 (start 15).
             let (g_ls_a, g_ld_a, g_r_long) =
                 stab8_bwd(
-                    w, slow, last_s, last_d, curve.out, *rating, 7, wc.aa7, curve.ln_s,
+                    w, slow, last_s, curve.out, *rating, 7, wc.aa7, curve.ln_s,
                     g_ns2 + g_slow_from_relearn, gw,
                 );
+            let g_r_curve = g_r_long + g_r_loss;
             let (g_lsf_b, g_ld_b, g_r1_short) =
                 stab8_bwd(
-                    w, fast, last_sf, last_d, curve.r1, *rating, 15, wc.aa16, curve.ln_sf, g_fast_out,
+                    w, fast, last_sf, curve.r1, *rating, 15, wc.aa16, curve.ln_sf, g_fast_out,
                     gw,
                 );
+            let g_ld_ab = g_ld_a + g_ld_b;
             let (g_ld_c, g_r_nextd) =
                 next_d8_bwd(w, *nd_out_pre, *nd_delta_d, last_d, *rating, curve.out, g_nd2, gw, wc.exp3w5, *lapse);
             // curve.out adjoint = long-stab r + windowed loss adjoint + next_d r; curve.r1 = short-stab r.
-            let (g_ls_d, g_lsf_d, g_ld_d) = curve8_bwd(
-                w, curve, last_s, last_sf, last_d, g_r_long + g_r_loss + g_r_nextd, g_r1_short,
-                gw, wc,
+            // The input-state adjoints: g_last_s = g_ls_a + g_ls_d, g_last_sf = g_lsf_b + g_lsf_d and
+            // g_last_d = ((g_ld_a + g_ld_b) + g_ld_c) + g_ld_d, summed inside curve8_bwd_acc.
+            let (mut g_last_s, mut g_last_sf, mut g_last_d) = curve8_bwd_acc::<true>(
+                w, curve, last_s, last_sf, last_d, g_r_curve + g_r_nextd, g_r1_short,
+                gw, wc, (g_ls_a, g_lsf_b, g_ld_ab + g_ld_c),
             );
-            let mut g_last_s = g_ls_a + g_ls_d;
-            let mut g_last_sf = g_lsf_b + g_lsf_d;
-            let mut g_last_d = g_ld_a + g_ld_b + g_ld_c + g_ld_d;
             if PAD {
                 g_last_s += m0.blend(g_ns3, z);
                 g_last_sf += m0.blend(g_nsf3, z);
