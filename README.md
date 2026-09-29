@@ -4,6 +4,7 @@ An **autoresearch loop** that made [FSRS-rs](https://github.com/open-spaced-repe
 
 [![Campaign progress: cumulative median speedup (top) and median per-user optimizer time (bottom) vs iteration](result/history_plot.png)](result/history_plot.png)
 
+Logarithmic Y axes:
 [![The same two panels with logarithmic y axes](result/history_plot_log.png)](result/history_plot_log.png)
 
 *Each point is an accepted change, measured against the then-current champion. The top panel is the compounding median speedup vs the original baseline; see [Tracking progress](#tracking-progress).*
