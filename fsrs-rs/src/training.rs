@@ -1442,7 +1442,7 @@ pub fn windowed_loss_with_params(
     for hb in &host {
         if hb.windowed {
             total_loss +=
-                crate::analytic::card_loss_simd(&w, &hb.th, &hb.rh, hb.seq, hb.bsz, &hb.lbl, &hb.wts);
+                crate::analytic::card_loss_simd(&w, &hb.th, &hb.rh, hb.seq, hb.bsz, &hb.wts);
             total_w += hb.wts.iter().map(|&x| x as f64).sum::<f64>();
         }
     }
@@ -1608,14 +1608,14 @@ impl CardedPlan {
         let mut slots = vec![(0i64, u32::MAX); 1 << bits];
         let home = |id: i64, bits: u32| ((id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - bits)) as usize;
         let mut cards: Vec<PlanCard> = Vec::with_capacity(n_cards);
-        // Each item's card (u32::MAX = skipped): 4 bytes per item, so the plan touches fewer fresh
-        // pages; the grouping below reads t from the item again (in order).
-        let mut item_card: Vec<u32> = Vec::with_capacity(items.len());
+        // Each item's card << 32 | its step t (u64::MAX = skipped), so the grouping below does not
+        // read the items again.
+        let mut item_card: Vec<u64> = Vec::with_capacity(items.len());
         let mut n_preds = 0;
         for (idx, (item, &id)) in items.iter().zip(card_ids).enumerate() {
             let len = item.reviews.len();
             if len > max_seq_len {
-                item_card.push(u32::MAX);
+                item_card.push(u64::MAX);
                 continue;
             }
             let mut h = home(id, bits);
@@ -1649,7 +1649,7 @@ impl CardedPlan {
             }
             card.n_preds += 1;
             n_preds += 1;
-            item_card.push(ci as u32);
+            item_card.push((ci as u64) << 32 | (len - 1) as u64);
         }
         // Each card's predictions, contiguous and in input order (a counting sort).
         let mut start = vec![0usize; cards.len() + 1];
@@ -1658,10 +1658,11 @@ impl CardedPlan {
         }
         let mut fill = start.clone();
         let mut by_card = vec![(0u32, 0u32); n_preds];
-        for (idx, (&ci, item)) in item_card.iter().zip(items).enumerate() {
-            if ci != u32::MAX {
-                by_card[fill[ci as usize]] = (item.reviews.len() as u32 - 1, idx as u32);
-                fill[ci as usize] += 1;
+        for (idx, &ct) in item_card.iter().enumerate() {
+            if ct != u64::MAX {
+                let ci = (ct >> 32) as usize;
+                by_card[fill[ci]] = (ct as u32, idx as u32);
+                fill[ci] += 1;
             }
         }
         // Order the cards by (full length, card id), a total order (a card's id is unique): a
@@ -1714,8 +1715,8 @@ impl CardedPlan {
         let seq = batch.iter().map(|&ci| self.cards[ci].full_len as usize).max().unwrap_or(0);
         let mut th = vec![0.0f32; seq * bsz];
         let mut rh = vec![0.0f32; seq * bsz];
-        let mut lbl = vec![0.0f32; seq * bsz];
-        let mut wts = vec![-0.0f32; seq * bsz]; // signed weights (analytic::signed_weight)
+        // Signed weights (analytic::signed_weight): their sign bits are the labels.
+        let mut wts = vec![-0.0f32; seq * bsz];
         let mut predictions = 0;
         // One independent load from each card's review buffer first (the cache misses overlap).
         let touch = batch.iter().fold(0u32, |a, &ci| {
@@ -1732,12 +1733,11 @@ impl CardedPlan {
                 let t = t as usize;
                 let label = if reviews[t].rating == 1 { 0.0 } else { 1.0 };
                 wts[t * bsz + c] = crate::analytic::signed_weight(weight(idx as usize, length), label);
-                lbl[t * bsz + c] = label;
             }
             predictions += self.cards[ci].n_preds as usize;
         }
         BatchHost {
-            seq, bsz, real_batch_size: predictions, th, rh, dts: Vec::new(), lbl, wts, windowed: true,
+            seq, bsz, real_batch_size: predictions, th, rh, dts: Vec::new(), lbl: Vec::new(), wts, windowed: true,
             cols: batch.len(),
         }
     }
@@ -1836,11 +1836,11 @@ impl GradShared<'_> {
             // 4 empty lanes' gradient is exactly zero.
             let gg = if g == n - 1 && hb.cols % 8 != 0 && hb.cols % 8 <= 4 {
                 crate::analytic::k4::card_group_grad(
-                    w, wc, &hb.th, &hb.rh, hb.seq, hb.bsz, &hb.lbl, &hb.wts, g, &mut caches.1,
+                    w, wc, &hb.th, &hb.rh, hb.seq, hb.bsz, &hb.wts, g, &mut caches.1,
                 )
             } else {
                 crate::analytic::card_group_grad(
-                    w, wc, &hb.th, &hb.rh, hb.seq, hb.bsz, &hb.lbl, &hb.wts, g, &mut caches.0,
+                    w, wc, &hb.th, &hb.rh, hb.seq, hb.bsz, &hb.wts, g, &mut caches.0,
                 )
             };
             for (o, x) in self.out[g].iter().zip(gg.chunks_exact(2)) {
@@ -2158,7 +2158,7 @@ fn train<B: AutodiffBackend>(
             for hb in train_host.iter().filter_map(|slot| slot.get()) {
                 if hb.windowed {
                     vloss += crate::analytic::card_loss_simd(
-                        &w_host, &hb.th, &hb.rh, hb.seq, hb.bsz, &hb.lbl, &hb.wts,
+                        &w_host, &hb.th, &hb.rh, hb.seq, hb.bsz, &hb.wts,
                     );
                 }
             }

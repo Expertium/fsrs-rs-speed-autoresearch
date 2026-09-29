@@ -909,7 +909,7 @@ mod tests {
             loss_and_grad_range_window(&w, &th, &rh, seq, batch, &lbl, &wts, &mut gs, 0, batch);
         let mut gv = [0.0f64; 34];
         let swts: Vec<f32> = wts.iter().zip(&lbl).map(|(&x, &l)| signed_weight(x, l)).collect();
-        card_loss_and_grad_simd(&w, &th, &rh, seq, batch, &lbl, &swts, &mut gv);
+        card_loss_and_grad_simd(&w, &th, &rh, seq, batch, &swts, &mut gv);
         let mut num = 0.0f64;
         let mut den = 0.0f64;
         for i in 0..34 {
@@ -919,7 +919,7 @@ mod tests {
         let rel = (num / den.max(1e-12)).sqrt();
         assert!(rel < 8e-3, "simd window grad vs scalar window grad rel-L2 {rel:e}\nscalar={gs:?}\nsimd={gv:?}");
         // The validation forward (card_loss_simd) must match the scalar oracle's loss too.
-        let loss_simd = card_loss_simd(&w, &th, &rh, seq, batch, &lbl, &wts);
+        let loss_simd = card_loss_simd(&w, &th, &rh, seq, batch, &swts);
         let lrel = ((loss_scalar - loss_simd) / loss_scalar.abs().max(1e-9)).abs();
         assert!(lrel < 5e-3, "card_loss_simd {loss_simd} vs scalar window {loss_scalar} rel {lrel:e}");
     }

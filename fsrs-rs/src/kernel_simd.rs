@@ -930,19 +930,27 @@ pub(crate) fn batch_loss_and_grad_simd(
 /// A fn, not a closure: LLVM did not inline the closure (a real call per step).
 /// `weights` are the windowed batches' SIGNED weights (signed_weight): sign(label - r) is +1 for
 /// label 1 and -1 for label 0 (r is inside (0, 1)), so (0 - wt) * (sign / den) is exactly
-/// swt * (1 / den) with swt = sign * (0 - wt) precomputed by the layout.
+/// swt * (1 / den) with swt = sign * (0 - wt) precomputed by the layout. The sign bit of swt is the
+/// label (set: label 1), so the batches hold no labels; a zero weight's sign may differ, but its
+/// adjoint is a zero of swt's sign either way.
 #[inline(always)]
-pub(super) fn g_r_loss_at(r_raw: F, weights: &[f32], labels: &[f32], base: usize) -> F {
+pub(super) fn g_r_loss_at(r_raw: F, weights: &[f32], base: usize) -> F {
     let k = F::splat;
     let (one, z) = (k(1.0), k(0.0));
     let swt = load8(weights, base);
-    let lbl = load8(labels, base);
     let r = clamp8(r_raw, MIN_R, MAX_R);
-    let dd = lbl - r;
-    let g_r = swt * (one / (one - dd.fast_max(z - dd)));
+    let g_r = swt * (one / (one - abs_label_diff(swt, r)));
     (r_raw.cmp_gt(k(MIN_R)) & r_raw.cmp_lt(k(MAX_R))).blend(g_r, z)
 }
 
+
+/// |label - r| for label = the sign bit of the signed weight `swt` (see g_r_loss_at): 1 - r for
+/// label 1, r for label 0 (the values the old max(label - r, r - label) gave).
+#[inline(always)]
+fn abs_label_diff(swt: F, r: F) -> F {
+    let label1: F = bytemuck::cast(bytemuck::cast::<F, I>(swt) >> 31);
+    label1.blend(F::splat(1.0) - r, r)
+}
 
 /// Windowed forward + reverse-mode backward for one card-grouped batch. Accumulates d(loss)/d(w) into
 /// `gw` (length 36); the loss VALUE is unused by training (only the gradient drives Adam), so the f64
@@ -950,14 +958,14 @@ pub(super) fn g_r_loss_at(r_raw: F, weights: &[f32], labels: &[f32], base: usize
 /// to a multiple of 8. Training splits the groups over two threads via `card_group_grad` instead.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn card_loss_and_grad_simd(
-    w: &[f32], t_hist: &[f32], r_hist: &[f32], seq_len: usize, batch: usize,
-    labels: &[f32], weights: &[f32], gw: &mut [f64],
+    w: &[f32], t_hist: &[f32], r_hist: &[f32], seq_len: usize, batch: usize, weights: &[f32],
+    gw: &mut [f64],
 ) -> f64 {
     debug_assert!(batch % 8 == 0, "card_loss_and_grad_simd needs batch padded to a multiple of 8");
     let wc = wconsts(w);
     let mut caches: Vec<Step8> = Vec::with_capacity(seq_len);
     for g in 0..batch / 8 {
-        let gg = card_group_grad(w, &wc, t_hist, r_hist, seq_len, batch, labels, weights, g, &mut caches);
+        let gg = card_group_grad(w, &wc, t_hist, r_hist, seq_len, batch, weights, g, &mut caches);
         for i in 0..34 {
             gw[i] += gg[i] as f64;
         }
@@ -971,7 +979,7 @@ pub(crate) fn card_loss_and_grad_simd(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn card_group_grad(
     w: &[f32], wc: &WConsts, t_hist: &[f32], r_hist: &[f32], seq_len: usize, batch: usize,
-    labels: &[f32], weights: &[f32], g: usize, caches: &mut Vec<Step8>,
+    weights: &[f32], g: usize, caches: &mut Vec<Step8>,
 ) -> [f32; 34] {
     debug_assert!(seq_len >= 2, "windowed grad needs seq_len >= 2 (min surviving prefix length is 2)");
     let k = F::splat;
@@ -1003,8 +1011,8 @@ pub(crate) fn card_group_grad(
     // Reverse pass, from the final state's adjoint 0 (at the last step only its curve's loss counts).
     let mut gw_g = [z; 34];
     let (mut g_s, mut g_sf, mut g_d) = (z, z, z);
-    for (t, ((cache, wr), lr)) in caches.iter().zip(rows(weights)).zip(rows(labels)).enumerate().rev() {
-        let g_r_loss = g_r_loss_at(cache.curve.out, wr, lr, c0);
+    for (t, (cache, wr)) in caches.iter().zip(rows(weights)).enumerate().rev() {
+        let g_r_loss = g_r_loss_at(cache.curve.out, wr, c0);
         let last = t + 1 == n_steps;
         (g_s, g_d, g_sf) = step8_bwd::<false>(w, cache, (g_s, g_d, g_sf), g_r_loss, &mut gw_g, wc, last);
     }
@@ -1063,8 +1071,7 @@ pub(super) fn finish_gw(gw_g: &[F; 34], w: &[f32], wc: &WConsts) -> [f32; 34] {
 /// accumulation). Batch padded to a multiple of 8.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn card_loss_simd(
-    w: &[f32], t_hist: &[f32], r_hist: &[f32], seq_len: usize, batch: usize,
-    labels: &[f32], weights: &[f32],
+    w: &[f32], t_hist: &[f32], r_hist: &[f32], seq_len: usize, batch: usize, weights: &[f32],
 ) -> f64 {
     let wc = wconsts(w);
     let k = F::splat;
@@ -1106,9 +1113,9 @@ pub(crate) fn card_loss_simd(
                 // label 1, -ln(1-r) for label 0). Branchless, so the whole 8-lane BCE is ONE vectorized
                 // ln8. Padding/filtered lanes have weight 0. The BCE ln uses the accurate ::<false>,
                 // as does the forward recurrence now (iter23's cruder windowed minimax was reverted).
-                let lbl = load8(labels, base);
-                let wt = load8(weights, base).abs(); // signed weights (signed_weight)
-                let arg = k(1.0) - (lbl - r).fast_max(r - lbl); // 1 - |label - r|
+                let swt = load8(weights, base); // signed weights (signed_weight): the sign is the label
+                let arg = k(1.0) - abs_label_diff(swt, r); // 1 - |label - r|
+                let wt = swt.abs();
                 loss += ((z - wt) * ln8::<false>(arg)).reduce_add() as f64;
             }
         }
