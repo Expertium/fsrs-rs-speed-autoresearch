@@ -50,6 +50,10 @@ start /high /affinity 0xFFFFFFF0 python compute_parameters.py --algo FSRS-rs --s
 
 ## Measuring a candidate — OFFICIAL from iter34: the PAIRED protocol (Andrew 2026-09-28)
 
+**RESOURCE LIMITS (Andrew 2026-09-29): at most 4 threads in total, and keep at least 10 GB of RAM free.** A 10-worker
+paired run on the 1000-user cache (~6 GB per worker) made his PC unusable. `measure_paired.py` therefore defaults to
+`FSRS_PAIRED_SLOTS=1` (2 workers x 2 CPUs = 4 threads, ~1 min per run); the 5-slot description below is the old load.
+
 **`python profiling/measure_paired.py <champion.pyd> <candidate.pyd> [out.json]`** is the official timing for every iteration from iter34 on. It prints `speed_ratio` (median of per-user t_champion / t_candidate), `mean_speedup`, `param_hash_diffs` (0 = bit-for-bit), both mean LogLosses and `logloss_in_band` (the 3b bar). ~12 s per run.
 - **Why (Andrew's idea):** the champion and the candidate run the SAME user AT THE SAME TIME, so background load that changes over time (other projects' jobs, thermal drift) hits both equally and cancels in the ratio. The old back-to-back runs were ~5 minutes apart and absorbed the load difference.
 - **Design:** 5 pair slots × 2 binaries = 10 worker processes of 2 logical CPUs each (same total load as `--processes 10`), off CPUs 0-3, HIGH priority. A slot takes the next user (largest first) and runs it 3 times on both binaries at once; the next user starts only when both finish (so the faster binary never leaves the slower one a quieter machine). Between reps the two binaries swap CPU blocks AND start order (a fixed start order leaned ~0.3% toward the first). Per-user time = min of 3. Each binary is loaded from its own temp copy of the `.pyd`, so no `.pyd` swap into `target/` is needed.

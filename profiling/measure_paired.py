@@ -29,7 +29,10 @@ import tempfile
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # FSRS_PAIRED_RAW selects another cache (e.g. raw1000.pkl for the 1000-user validation).
 RAW = os.path.join(REPO, "profiling", "devbench", os.environ.get("FSRS_PAIRED_RAW", "raw50.pkl"))
-N_SLOTS, REPS, FIRST_CPU = 5, 3, 4
+# Andrew 2026-09-29: at most 4 threads in total while he uses the PC -> 1 pair slot (2 workers x 2 CPUs).
+# FSRS_PAIRED_SLOTS=5 restores the original 10-worker load.
+N_SLOTS = int(os.environ.get("FSRS_PAIRED_SLOTS", "1"))
+REPS, FIRST_CPU = 3, 4
 
 
 def _worker(pyd, conn):
