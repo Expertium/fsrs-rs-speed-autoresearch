@@ -1726,6 +1726,19 @@ struct GradShared<'a> {
 
 const JOB_STOP: u64 = u64::MAX;
 
+/// Drops the prefix-items in blocks: first one independent load from each item's review buffer
+/// (the loads overlap), then the frees, which find the allocation's heap entry in cache. Freeing
+/// straight through waits on one cache miss per item (~100 ns each on a large collection).
+fn free_items(mut items: Vec<FSRSItem>) {
+    for block in items.chunks_mut(128) {
+        let touch = block.iter().fold(0u32, |a, it| a ^ it.reviews.first().map_or(0, |r| r.rating));
+        std::hint::black_box(touch);
+        for it in block {
+            drop(std::mem::take(&mut it.reviews));
+        }
+    }
+}
+
 impl GradShared<'_> {
     /// Claim and compute groups of job `seq` until none is left (or the job changed).
     fn work(&self, seq: u32, w: &[f32], wc: &crate::analytic::WConsts, caches: &mut Vec<crate::analytic::Step8>) {
@@ -1759,7 +1772,8 @@ impl GradShared<'_> {
         for &b in first_order {
             let _ = self.host[b].set(plan.layout(&items, b, &weight));
         }
-        drop((plan, items, card_ids));
+        drop((plan, card_ids));
+        free_items(items);
         let mut caches = Vec::new();
         let mut seen = 0u32;
         loop {
