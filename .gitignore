@@ -17,3 +17,4 @@ _commit_msg.txt
 # Dev-bench cache of per-user raw arrays (derived from the external dataset; regenerate with profiling/devbench/cache_raw.py)
 profiling/devbench/raw50.pkl
 profiling/devbench/raw*.pkl
+profiling/devbench/raw*_split/

@@ -29,6 +29,28 @@ import tempfile
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # FSRS_PAIRED_RAW selects another cache (e.g. raw1000.pkl for the 1000-user validation).
 RAW = os.path.join(REPO, "profiling", "devbench", os.environ.get("FSRS_PAIRED_RAW", "raw50.pkl"))
+
+
+class _Raw:
+    """The raw cache: one pickle (all users in memory), or a split_raw.py directory (one user per file,
+    loaded on demand: a worker then holds one user, not ~6 GB for raw1000)."""
+
+    def __init__(self):
+        self.split = os.path.isdir(RAW)
+        self.data = None if self.split else pickle.load(open(RAW, "rb"))
+        self.cur = (None, None)
+
+    def sizes(self):
+        if self.split:
+            return pickle.load(open(os.path.join(RAW, "index.pkl"), "rb"))
+        return {u: len(v[0]) for u, v in self.data.items()}
+
+    def __getitem__(self, user):
+        if not self.split:
+            return self.data[user]
+        if self.cur[0] != user:
+            self.cur = (user, pickle.load(open(os.path.join(RAW, f"u{user}.pkl"), "rb")))
+        return self.cur[1]
 # Andrew 2026-09-29: at most 4 threads in total while he uses the PC -> 1 pair slot (2 workers x 2 CPUs).
 # FSRS_PAIRED_SLOTS=5 restores the original 10-worker load.
 N_SLOTS = int(os.environ.get("FSRS_PAIRED_SLOTS", "1"))
@@ -44,7 +66,7 @@ def _worker(pyd, conn):
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     fsrs = mod.FSRS(parameters=[])
-    raw = pickle.load(open(RAW, "rb"))
+    raw = _Raw()
     proc = psutil.Process()
     proc.nice(psutil.HIGH_PRIORITY_CLASS)
     conn.send("ready")
@@ -115,9 +137,8 @@ def main():
         dst = os.path.join(tmp, tag, "fsrs_rs_python.cp312-win_amd64.pyd")
         shutil.copy2(src, dst)
         paths.append(dst)
-    raw = pickle.load(open(RAW, "rb"))
-    order = sorted(raw, key=lambda u: -len(raw[u][0]))  # largest first
-    del raw
+    sizes = _Raw().sizes()
+    order = sorted(sizes, key=lambda u: -sizes[u])  # largest first
     mgr = mp.Manager()
     queue, results = mgr.Queue(), mgr.dict()
     for u in order:
