@@ -1747,8 +1747,9 @@ struct GradShared<'a> {
     job: AtomicU64,
     batch: AtomicUsize,
     w: [AtomicU32; 34],
-    done: AtomicUsize,
     out: Vec<[AtomicU32; 34]>,
+    /// ready[g] = the job sequence whose group g is stored in out[g].
+    ready: Vec<AtomicU32>,
     /// The prefix-items, once the helper has laid out every batch: freed a block at a time by a
     /// thread that would otherwise wait (see free_some).
     trash: Mutex<Vec<FSRSItem>>,
@@ -1790,8 +1791,10 @@ impl GradShared<'_> {
             if self.job.compare_exchange_weak(v, v + 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
                 continue;
             }
-            // Longest groups first (cards are length-sorted within a batch): better balance.
-            let g = n - 1 - k;
+            // In group order, so the main thread can add each group's gradient as soon as it is
+            // ready. (A batch's cards are length-sorted, so its groups are about equally long; the
+            // last group, the one most often short (4-lane tail), comes last.)
+            let g = k;
             // A last group of at most 4 cards runs on 4 lanes: the same per-lane arithmetic, and the
             // 4 empty lanes' gradient is exactly zero.
             let gg = if g == n - 1 && hb.cols % 8 != 0 && hb.cols % 8 <= 4 {
@@ -1806,7 +1809,7 @@ impl GradShared<'_> {
             for (o, x) in self.out[g].iter().zip(gg) {
                 o.store(x.to_bits(), Ordering::Relaxed);
             }
-            self.done.fetch_add(1, Ordering::Release);
+            self.ready[g].store(seq, Ordering::Release);
         }
     }
 
@@ -1938,8 +1941,8 @@ fn train<B: AutodiffBackend>(
         job: AtomicU64::new(0),
         batch: AtomicUsize::new(0),
         w: std::array::from_fn(|_| AtomicU32::new(0)),
-        done: AtomicUsize::new(0),
         out: (0..max_bsz / 8).map(|_| std::array::from_fn(|_| AtomicU32::new(0))).collect(),
+        ready: (0..max_bsz / 8).map(|_| AtomicU32::new(0)).collect(),
         trash: Mutex::new(Vec::new()),
     };
     let mut caches = (Vec::new(), Vec::new());
@@ -1983,7 +1986,6 @@ fn train<B: AutodiffBackend>(
                     a.store(x.to_bits(), Ordering::Relaxed);
                 }
                 shared.batch.store(bi, Ordering::Relaxed);
-                shared.done.store(0, Ordering::Relaxed);
                 seq += 1;
                 shared.job.store((seq as u64) << 32, Ordering::Release);
             }
@@ -2018,13 +2020,14 @@ fn train<B: AutodiffBackend>(
                 // groups split over the two threads (see GradShared).
                 let wc = crate::analytic::wconsts(w_vec);
                 shared.work(seq, w_vec, &wc, &mut caches);
-                let n = hb.bsz / 8;
-                while shared.done.load(Ordering::Acquire) < n {
-                    if !shared.free_some() {
-                        std::hint::spin_loop();
+                // The groups in group order, each as soon as it is ready (so the adds overlap the
+                // helper's last group).
+                for (group, ready) in shared.out.iter().zip(&shared.ready).take(hb.bsz / 8) {
+                    while ready.load(Ordering::Acquire) != seq {
+                        if !shared.free_some() {
+                            std::hint::spin_loop();
+                        }
                     }
-                }
-                for group in &shared.out[..n] {
                     for (t, o) in total_grad.iter_mut().zip(group) {
                         *t += f32::from_bits(o.load(Ordering::Relaxed)) as f64;
                     }
