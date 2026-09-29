@@ -1592,10 +1592,14 @@ impl CardedPlan {
         // are read at layout time — no per-item heap access here).
         let mut card_index: HashMap<i64, usize, BuildHasherDefault<CardIdHasher>> = HashMap::default();
         let mut cards: Vec<PlanCard> = Vec::new();
-        let mut preds: Vec<(u32, u32, u32)> = Vec::with_capacity(items.len()); // (card, t, idx)
+        // Each item's card (u32::MAX = skipped): 4 bytes per item, so the plan touches fewer fresh
+        // pages; the grouping below reads t from the item again (in order).
+        let mut item_card: Vec<u32> = Vec::with_capacity(items.len());
+        let mut n_preds = 0;
         for (idx, (item, &id)) in items.iter().zip(card_ids).enumerate() {
             let len = item.reviews.len();
             if len > max_seq_len {
+                item_card.push(u32::MAX);
                 continue;
             }
             let ci = *card_index.entry(id).or_insert_with(|| {
@@ -1609,7 +1613,8 @@ impl CardedPlan {
                 card.longest = idx as u32;
             }
             card.n_preds += 1;
-            preds.push((ci as u32, len as u32 - 1, idx as u32));
+            n_preds += 1;
+            item_card.push(ci as u32);
         }
         // Each card's predictions, contiguous and in input order (a counting sort).
         let mut start = vec![0usize; cards.len() + 1];
@@ -1617,17 +1622,23 @@ impl CardedPlan {
             start[ci + 1] = start[ci] + card.n_preds as usize;
         }
         let mut fill = start.clone();
-        let mut by_card = vec![(0u32, 0u32); preds.len()];
-        for &(ci, t, idx) in &preds {
-            by_card[fill[ci as usize]] = (t, idx);
-            fill[ci as usize] += 1;
+        let mut by_card = vec![(0u32, 0u32); n_preds];
+        for (idx, (&ci, item)) in item_card.iter().zip(items).enumerate() {
+            if ci != u32::MAX {
+                by_card[fill[ci as usize]] = (item.reviews.len() as u32 - 1, idx as u32);
+                fill[ci as usize] += 1;
+            }
         }
-        // Sort the keys themselves (no per-comparison lookups into `cards`).
-        let mut keys: Vec<(u32, i64, u32)> = (cards.iter().enumerate())
-            .map(|(ci, card)| (card.full_len, card_ids[card.longest as usize], ci as u32))
+        // Sort by (full length, card id) as ONE u128 key (the id's sign bit flipped so the unsigned
+        // order is the signed one; the card index in the low bits): a total order, the same one.
+        let mut keys: Vec<u128> = (cards.iter().enumerate())
+            .map(|(ci, card)| {
+                let id = card_ids[card.longest as usize] as u64 ^ (1 << 63);
+                (card.full_len as u128) << 96 | (id as u128) << 32 | ci as u128
+            })
             .collect();
         keys.sort_unstable();
-        let order: Vec<usize> = keys.iter().map(|&(_, _, ci)| ci as usize).collect();
+        let order: Vec<usize> = keys.iter().map(|&k| k as u32 as usize).collect();
         let mut bounds = Vec::new();
         let (mut first, mut current_preds) = (0, 0);
         for (k, &ci) in order.iter().enumerate() {
@@ -1641,7 +1652,7 @@ impl CardedPlan {
         if first < order.len() {
             bounds.push((first, order.len()));
         }
-        Self { cards, start, by_card, order, bounds, n_items: items.len(), n_preds: preds.len() }
+        Self { cards, start, by_card, order, bounds, n_items: items.len(), n_preds }
     }
 
     /// Padded column count of batch `b` (a multiple of 8: the SIMD kernels' 8-card groups).

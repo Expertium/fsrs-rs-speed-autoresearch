@@ -9,7 +9,7 @@
 //! Result is not bit-for-bit vs autodiff (different FP order) but is judged by the
 //! ±0.0010 average-log-loss band.
 
-use wide::{CmpEq, CmpGe, CmpGt, CmpLe, CmpLt, f32x8, i32x8};
+use wide::{CmpEq, CmpGe, CmpGt, CmpLe, CmpLt, f32x4, f32x8, i32x8};
 
 const S_MIN: f32 = 0.0001;
 const S_MAX: f32 = 36500.0;
@@ -957,11 +957,11 @@ fn stab8_bwd(
     // aa / ln_ls are passed in (not cached): the same values stab8_fwd_into used.
     let aa = k(aa);
     let he = c.he;
-    let gt1 = rating.cmp_gt(one);
-    let g_nss = gt1.blend(g_out, z);
-    // Without the post-lapse branch (see stab8_fwd_into) every success lane routes to ls_sinc, and the
-    // other lanes carry a zero adjoint.
+    // Without the post-lapse branch (see stab8_fwd_into) every lane routes to ls_sinc: no lane
+    // lapsed, so every real lane has rating > 1, and a padding lane's adjoint is already zero.
     let (mut g_last_s, g_ls_sinc, g_nsf_fail) = if c.full {
+        let gt1 = rating.cmp_gt(one);
+        let g_nss = gt1.blend(g_out, z);
         let pls = last_s.fast_min(c.nsf_fail);
         let ls_sinc = last_s * c.sinc;
         let g_pls_direct = gt1.blend(z, g_out);
@@ -973,7 +973,7 @@ fn stab8_bwd(
         let g_ls = last_s.cmp_le(c.nsf_fail).blend(g_pls, z);
         (g_ls, g_ls_sinc, c.nsf_fail.cmp_lt(last_s).blend(g_pls, z))
     } else {
-        (z, g_nss, z)
+        (z, g_out, z)
     };
     g_last_s += g_ls_sinc * c.sinc;
     let g_sinc = g_ls_sinc * last_s;
@@ -1611,7 +1611,20 @@ pub(crate) fn card_group_grad(
 /// leaves out: slot 27 = sum(g_z) (-> gw[27], gw[28]), slot 26 = sum(x2) and slot 28 = the direct
 /// decay2 term (-> gw[26], gw[24]), slot 25 = sum(g_lw27), slots 10 / 18 = sum(n_ln) per trace.
 fn finish_gw(gw_g: &[f32x8; 34], w: &[f32], wc: &WConsts) -> [f32; 34] {
-    let mut g: [f32; 34] = std::array::from_fn(|i| gw_g[i].reduce_add());
+    // The lane sums in reduce_add's exact order (per half ((x0 + x1) + x2) + x3, as f32 sum() from
+    // -0.0 gives, then low + high), four slots at a time on transposed halves instead of one slot
+    // at a time through memory.
+    let halves: &[f32x4] = bytemuck::cast_slice(&gw_g[..]);
+    let mut g = [0.0f32; 34];
+    for c in (0..34).step_by(4) {
+        let h = |s: usize, k: usize| if s < 34 { halves[2 * s + k] } else { f32x4::ZERO };
+        let lo = f32x4::transpose([h(c, 0), h(c + 1, 0), h(c + 2, 0), h(c + 3, 0)]);
+        let hi = f32x4::transpose([h(c, 1), h(c + 1, 1), h(c + 2, 1), h(c + 3, 1)]);
+        let sum = (((lo[0] + lo[1]) + lo[2]) + lo[3]) + (((hi[0] + hi[1]) + hi[2]) + hi[3]);
+        for (k, v) in sum.to_array().into_iter().enumerate().take(34 - c) {
+            g[c + k] = v;
+        }
+    }
     let (s_z, s_x2, s_dec2) = (g[27], g[26], g[28]);
     g[27] = s_z * wc.nrw27;
     g[28] = s_z * wc.rw28;
