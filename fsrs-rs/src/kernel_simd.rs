@@ -307,7 +307,9 @@ pub(super) fn curve8_bwd_acc<const ACC: bool>(
 #[inline(always)]
 pub(super) fn hard_easy8(w: &[f32], rating: F, start: usize) -> F {
     let k = F::splat;
-    rating.cmp_eq(k(2.0)).blend(k(w[start + 6]), rating.cmp_eq(k(4.0)).blend(k(w[start + 7]), k(1.0)))
+    // The two masks never overlap, so the blends are one bitwise select: fewer SSE2 ops.
+    let (m2, m4) = (rating.cmp_eq(k(2.0)), rating.cmp_eq(k(4.0)));
+    (m2 & k(w[start + 6])) | (m4 & k(w[start + 7])) | (!(m2 | m4) & k(1.0))
 }
 
 // F stability-after-review forward + the intermediates its backward needs (analogue of StabCache).
@@ -984,9 +986,10 @@ pub(crate) fn card_group_grad(
     }
     let caches = &mut caches[..n_cached];
     let ((mut s, mut d, mut sf), first) = first8_fwd::<false>(w, load8(r_hist, c0));
-    for (t, slot) in (1..).zip(caches.iter_mut()) {
-        let base = t * batch + c0;
-        (s, d, sf) = step8_fwd_into::<false, false>(w, load8(t_hist, base), load8(r_hist, base), (s, d, sf), wc, slot);
+    // Steps 1..=n_cached walk the rows of the [seq, batch] arrays (so no per-step bounds checks).
+    let rows = |a| steps_rows(a, batch, n_cached);
+    for ((slot, th), rh) in caches.iter_mut().zip(rows(t_hist)).zip(rows(r_hist)) {
+        (s, d, sf) = step8_fwd_into::<false, false>(w, load8(th, c0), load8(rh, c0), (s, d, sf), wc, slot);
     }
     // Last step (t = seq_len-1, always >= 1): curve ONLY, from the incoming state (step8_fwd
     // outputs are already clamped) — the exact curve step8_fwd would compute.
@@ -1001,13 +1004,19 @@ pub(crate) fn card_group_grad(
     // Ungated, like step8_bwd's input adjoints (the previous step's backward applies the mask).
     let (mut g_s, mut g_sf, mut g_d) =
         curve8_bwd(w, &fc_last, s, sf, d, g_rraw_last, z, &mut gw_g, wc);
-    for (t, cache) in caches.iter().enumerate().rev() {
-        let g_r_loss = g_r_loss_at(cache.curve.out, weights, labels, (t + 1) * batch + c0);
+    for ((cache, wr), lr) in caches.iter().zip(rows(weights)).zip(rows(labels)).rev() {
+        let g_r_loss = g_r_loss_at(cache.curve.out, wr, lr, c0);
         (g_s, g_d, g_sf) = step8_bwd::<false>(w, cache, (g_s, g_d, g_sf), g_r_loss, &mut gw_g, wc);
     }
     // init step (t==0): no prediction (min surviving prefix length is 2).
     first8_bwd(&first, (g_s, g_d, g_sf), &mut gw_g);
     finish_gw(&gw_g, w, wc)
+}
+
+/// The rows of steps 1..=n of a row-major [seq, batch] array.
+#[inline(always)]
+fn steps_rows(a: &[f32], batch: usize, n: usize) -> std::slice::ChunksExact<'_, f32> {
+    a[batch..(n + 1) * batch].chunks_exact(batch)
 }
 
 /// Lane sums of a group's gradient bank, with the weight-only factors that the per-step backward

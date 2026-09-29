@@ -1686,6 +1686,11 @@ impl CardedPlan {
         let mut lbl = vec![0.0f32; seq * bsz];
         let mut wts = vec![-0.0f32; seq * bsz]; // signed weights (analytic::signed_weight)
         let mut predictions = 0;
+        // One independent load from each card's review buffer first (the cache misses overlap).
+        let touch = batch.iter().fold(0u32, |a, &ci| {
+            a ^ items[self.cards[ci].longest as usize].reviews.first().map_or(0, |r| r.rating)
+        });
+        std::hint::black_box(touch);
         for (c, &ci) in batch.iter().enumerate() {
             let reviews = &items[self.cards[ci].longest as usize].reviews;
             for (t, r) in reviews.iter().enumerate() {

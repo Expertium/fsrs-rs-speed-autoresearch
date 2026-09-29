@@ -57,6 +57,7 @@ Accept metric: **median per-user speed_ratio ≥ 1.05** (constraint 12) AND **sp
 | 50 | 7 | 6 | 1.036 | 11258 | 11304 | 1.004 | 1.010 | ✓ | rejected | iter49 plus items freed in idle waits and first step in its own struct |
 | 51 | 7 | 6 | 1.045 | 11258 | 11339 | 1.007 | 1.018 | ✓ | rejected | iter50 plus presized plan map, counting sort by length, main lays out first batch |
 | 52 | 7 | 7 | 1.048 | 11258 | 11345 | 1.008 | 1.019 | ✓ | rejected | iter51 plus groups claimed in order, main adds each group as it finishes |
+| 53 | 7 | 6 | 1.056 | 11258 | 11364 | 1.009 | 1.024 | ✓ | accepted | iter52 stack plus row walks, one-select hard/easy factor, layout touch pass |
 
-**Cumulative speed_ratio (product of accepted): ×354.263** — upward-biased (winner's curse); anchor periodically vs iter-0 baseline.
+**Cumulative speed_ratio (product of accepted): ×373.960** — upward-biased (winner's curse); anchor periodically vs iter-0 baseline.
 
