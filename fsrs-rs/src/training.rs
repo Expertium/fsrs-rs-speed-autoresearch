@@ -1592,8 +1592,12 @@ impl CardedPlan {
         // One pass in input order over the item headers only (a prefix's label is the rating of
         // review t of its card's longest prefix, and its weight depends only on its index, so both
         // are read at layout time — no per-item heap access here).
-        let mut card_index: HashMap<i64, usize, BuildHasherDefault<CardIdHasher>> = HashMap::default();
-        let mut cards: Vec<PlanCard> = Vec::new();
+        // Each card has one prefix of length 2 (its first prediction): their count sizes the map
+        // and the card list, so neither grows (a map rehash moves every entry).
+        let n_cards = items.iter().filter(|item| item.reviews.len() == 2).count();
+        let mut card_index: HashMap<i64, usize, BuildHasherDefault<CardIdHasher>> =
+            HashMap::with_capacity_and_hasher(n_cards, BuildHasherDefault::default());
+        let mut cards: Vec<PlanCard> = Vec::with_capacity(n_cards);
         // Each item's card (u32::MAX = skipped): 4 bytes per item, so the plan touches fewer fresh
         // pages; the grouping below reads t from the item again (in order).
         let mut item_card: Vec<u32> = Vec::with_capacity(items.len());
@@ -1631,16 +1635,25 @@ impl CardedPlan {
                 fill[ci as usize] += 1;
             }
         }
-        // Sort by (full length, card id) as ONE u128 key (the id's sign bit flipped so the unsigned
-        // order is the signed one; the card index in the low bits): a total order, the same one.
-        let mut keys: Vec<u128> = (cards.iter().enumerate())
-            .map(|(ci, card)| {
-                let id = card_ids[card.longest as usize] as u64 ^ (1 << 63);
-                (card.full_len as u128) << 96 | (id as u128) << 32 | ci as u128
-            })
-            .collect();
-        keys.sort_unstable();
-        let order: Vec<usize> = keys.iter().map(|&k| k as u32 as usize).collect();
+        // Order the cards by (full length, card id), a total order (a card's id is unique): a
+        // counting sort by full length (<= max_seq_len), then each length's cards by id.
+        let mut at = vec![0usize; max_seq_len + 2];
+        for card in &cards {
+            at[card.full_len as usize + 1] += 1;
+        }
+        for l in 1..at.len() {
+            at[l] += at[l - 1];
+        }
+        let mut keys = vec![(0i64, 0u32); cards.len()];
+        let mut fill = at.clone();
+        for (ci, card) in cards.iter().enumerate() {
+            keys[fill[card.full_len as usize]] = (card_ids[card.longest as usize], ci as u32);
+            fill[card.full_len as usize] += 1;
+        }
+        for l in at.windows(2) {
+            keys[l[0]..l[1]].sort_unstable_by_key(|k| k.0);
+        }
+        let order: Vec<usize> = keys.iter().map(|k| k.1 as usize).collect();
         let mut bounds = Vec::new();
         let (mut first, mut current_preds) = (0, 0);
         for (k, &ci) in order.iter().enumerate() {
@@ -1799,8 +1812,10 @@ impl GradShared<'_> {
 
     /// The second thread: lay out the windowed batches in the order training first uses them, free
     /// the prefix-items, then help with every published job.
-    fn helper(&self, plan: CardedPlan, items: Vec<FSRSItem>, card_ids: Vec<i64>, first_order: &[usize]) {
-        let weight = recency_weight_tuned();
+    fn helper(
+        &self, plan: CardedPlan, items: Vec<FSRSItem>, card_ids: Vec<i64>, first_order: &[usize],
+        weight: impl Fn(usize, f32) -> f32,
+    ) {
         for &b in first_order {
             let _ = self.host[b].set(plan.layout(&items, b, &weight));
         }
@@ -1937,8 +1952,11 @@ fn train<B: AutodiffBackend>(
             }
         }
         TrainBatches::Planned(plan, items, card_ids) => {
-            let (shared, first_order) = (&shared, &first_order);
-            scope.spawn(move || shared.helper(plan, items, card_ids, first_order));
+            // The first batch is laid out here: starting the helper thread takes ~0.1 ms.
+            let weight = recency_weight_tuned();
+            let _ = train_host[first_order[0]].set(plan.layout(&items, first_order[0], &weight));
+            let (shared, rest) = (&shared, &first_order[1..]);
+            scope.spawn(move || shared.helper(plan, items, card_ids, rest, weight));
         }
     }
     for epoch in 1..=config.num_epochs {
