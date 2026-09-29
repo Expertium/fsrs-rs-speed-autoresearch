@@ -1001,10 +1001,20 @@ fn recency_weight_tuned() -> impl Fn(usize, f32) -> f32 {
         // exactly 0.0667 (checked for every f32 x in [0, 0.17]): skip the powf there.
         None => match idx as f32 / length {
             x if x <= 0.17 => 0.0667,
-            x => 0.0667 + 0.9333 * x.powf(11.25),
+            x => 0.0667 + 0.9333 * pow_11_25(x),
         },
         Some((c0, exp)) => c0 + (1.0 - c0) * (idx as f32 / length).powf(exp),
     }
+}
+
+/// x^11.25 = x^11 * sqrt(sqrt(x)) in f64, rounded once to f32: correctly rounded for every f32 x in
+/// (0.17, 1] where it differs from the C library's powf (1925 of 22.1M inputs, where powf is off by one
+/// ulp; checked at 200-bit precision), and about 40% faster.
+fn pow_11_25(x: f32) -> f32 {
+    let x = x as f64;
+    let x2 = x * x;
+    let x4 = x2 * x2;
+    ((x4 * x4) * x2 * x * x.sqrt().sqrt()) as f32
 }
 
 pub(crate) fn recency_weighted_fsrs_items_tuned(items: Vec<FSRSItem>) -> Vec<WeightedFSRSItem> {
@@ -1752,7 +1762,8 @@ struct GradShared<'a> {
     job: AtomicU64,
     batch: AtomicUsize,
     w: [AtomicU32; 34],
-    out: Vec<[AtomicU32; 34]>,
+    /// Each group's 34 gradient sums, two f32 per word (so the adds below go two at a time).
+    out: Vec<[AtomicU64; 17]>,
     /// ready[g] = the job sequence whose group g is stored in out[g].
     ready: Vec<AtomicU32>,
     /// The prefix-items, once the helper has laid out every batch: freed a block at a time by a
@@ -1811,8 +1822,8 @@ impl GradShared<'_> {
                     w, wc, &hb.th, &hb.rh, hb.seq, hb.bsz, &hb.lbl, &hb.wts, g, &mut caches.0,
                 )
             };
-            for (o, x) in self.out[g].iter().zip(gg) {
-                o.store(x.to_bits(), Ordering::Relaxed);
+            for (o, x) in self.out[g].iter().zip(gg.chunks_exact(2)) {
+                o.store(x[0].to_bits() as u64 | (x[1].to_bits() as u64) << 32, Ordering::Relaxed);
             }
             self.ready[g].store(seq, Ordering::Release);
         }
@@ -1946,7 +1957,7 @@ fn train<B: AutodiffBackend>(
         job: AtomicU64::new(0),
         batch: AtomicUsize::new(0),
         w: std::array::from_fn(|_| AtomicU32::new(0)),
-        out: (0..max_bsz / 8).map(|_| std::array::from_fn(|_| AtomicU32::new(0))).collect(),
+        out: (0..max_bsz / 8).map(|_| std::array::from_fn(|_| AtomicU64::new(0))).collect(),
         ready: (0..max_bsz / 8).map(|_| AtomicU32::new(0)).collect(),
         trash: Mutex::new(Vec::new()),
     };
@@ -1962,8 +1973,11 @@ fn train<B: AutodiffBackend>(
         TrainBatches::Planned(plan, items, card_ids) => {
             // The first batch is laid out here: starting the helper thread takes ~0.1 ms.
             let weight = recency_weight_tuned();
-            let _ = train_host[first_order[0]].set(plan.layout(&items, first_order[0], &weight));
-            let (shared, rest) = (&shared, &first_order[1..]);
+            let lead = first_order.len().min(2);
+            for &b in &first_order[..lead] {
+                let _ = train_host[b].set(plan.layout(&items, b, &weight));
+            }
+            let (shared, rest) = (&shared, &first_order[lead..]);
             scope.spawn(move || shared.helper(plan, items, card_ids, rest, weight));
         }
     }
@@ -2033,8 +2047,10 @@ fn train<B: AutodiffBackend>(
                             std::hint::spin_loop();
                         }
                     }
-                    for (t, o) in total_grad.iter_mut().zip(group) {
-                        *t += f32::from_bits(o.load(Ordering::Relaxed)) as f64;
+                    for (t, o) in total_grad.chunks_exact_mut(2).zip(group) {
+                        let v = o.load(Ordering::Relaxed);
+                        t[0] += f32::from_bits(v as u32) as f64;
+                        t[1] += f32::from_bits((v >> 32) as u32) as f64;
                     }
                 }
             } else {

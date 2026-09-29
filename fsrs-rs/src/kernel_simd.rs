@@ -873,7 +873,7 @@ pub(super) fn loss_and_grad_range_simd(
             (g_s, g_d, g_sf) = step8_bwd::<true>(w, cache, (g_s, g_d, g_sf), F::splat(0.0), &mut gw_g, &wc);
         }
         first8_bwd(&first, (g_s, g_d, g_sf), &mut gw_g);
-        let gg = finish_gw(&gw_g, w, &wc);
+        let gg = finish_gw::<false>(&gw_g, w, &wc);
         for i in 0..34 {
             gw[i] += gg[i] as f64;
         }
@@ -965,8 +965,6 @@ pub(crate) fn card_group_grad(
     labels: &[f32], weights: &[f32], g: usize, caches: &mut Vec<Step8>,
 ) -> [f32; 34] {
     debug_assert!(seq_len >= 2, "windowed grad needs seq_len >= 2 (min surviving prefix length is 2)");
-    let k = F::splat;
-    let z = k(0.0);
     let c0 = g * 8;
     // This group's own length: trailing timesteps where all 8 lanes are padding (rating 0; real
     // ratings are >= 1) carry weight 0 and only pass the state through, so they add exactly 0
@@ -975,12 +973,29 @@ pub(crate) fn card_group_grad(
     while seq_len > 2 && load8(r_hist, (seq_len - 1) * batch + c0).reduce_add() == 0.0 {
         seq_len -= 1;
     }
+    if seq_len == 2 {
+        group_grad::<true>(w, wc, t_hist, r_hist, 2, batch, labels, weights, c0, caches)
+    } else {
+        group_grad::<false>(w, wc, t_hist, r_hist, seq_len, batch, labels, weights, c0, caches)
+    }
+}
+
+/// card_group_grad for a group of trimmed length `seq_len`. SHORT: `seq_len` is 2 (every card of
+/// the group has 2 reviews), so there is no cached step and only the first-review and curve slots
+/// of the gradient bank are written.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn group_grad<const SHORT: bool>(
+    w: &[f32], wc: &WConsts, t_hist: &[f32], r_hist: &[f32], seq_len: usize, batch: usize,
+    labels: &[f32], weights: &[f32], c0: usize, caches: &mut Vec<Step8>,
+) -> [f32; 34] {
+    let z = F::splat(0.0);
     // Forward over every step EXCEPT the last (full step + cache). The last step's stability/
     // next-difficulty update feeds no t+1, so we compute its curve only (just below) — exactly
     // like card_loss_simd's validation skip-last. The first review (t==0) is peeled off (First8),
     // so caches[t - 1] is step t's. The cache slots are reused across groups (only the first
     // seq_len - 2 are this group's).
-    let n_cached = seq_len - 2;
+    let n_cached = if SHORT { 0 } else { seq_len - 2 };
     while caches.len() < n_cached {
         caches.push(Step8::default());
     }
@@ -1010,7 +1025,7 @@ pub(crate) fn card_group_grad(
     }
     // init step (t==0): no prediction (min surviving prefix length is 2).
     first8_bwd(&first, (g_s, g_d, g_sf), &mut gw_g);
-    finish_gw(&gw_g, w, wc)
+    finish_gw::<SHORT>(&gw_g, w, wc)
 }
 
 /// The rows of steps 1..=n of a row-major [seq, batch] array.
@@ -1022,25 +1037,35 @@ fn steps_rows(a: &[f32], batch: usize, n: usize) -> std::slice::ChunksExact<'_, 
 /// Lane sums of a group's gradient bank, with the weight-only factors that the per-step backward
 /// leaves out: slot 27 = sum(g_z) (-> gw[27], gw[28]), slot 26 = sum(x2) and slot 28 = the direct
 /// decay2 term (-> gw[26], gw[24]), slot 25 = sum(g_lw27), slots 10 / 18 = sum(n_ln) per trace.
-pub(super) fn finish_gw(gw_g: &[F; 34], w: &[f32], wc: &WConsts) -> [f32; 34] {
+pub(super) fn finish_gw<const SHORT: bool>(gw_g: &[F; 34], w: &[f32], wc: &WConsts) -> [f32; 34] {
     // The lane sums in reduce_add's exact order (per half ((x0 + x1) + x2) + x3, as f32 sum() from
     // -0.0 gives, then low + high), four slots at a time on transposed halves instead of one slot
     // at a time through memory.
     // N = 4 (the 4-lane tail groups, see card_group_grad): one half per slot; the 8-lane sum
     // would add the empty lanes' exact zeros as the high half.
+    // SHORT (a group with no cached step): only the first-review slots 0-5 and the curve slots
+    // 23, 25-33 were written; every other slot sums to exactly 0, the value g starts with.
+    // (Slot 34 = none.)
+    const ALL: [[usize; 4]; 9] = [
+        [0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11], [12, 13, 14, 15], [16, 17, 18, 19],
+        [20, 21, 22, 23], [24, 25, 26, 27], [28, 29, 30, 31], [32, 33, 34, 34],
+    ];
+    const FEW: [[usize; 4]; 4] = [[0, 1, 2, 3], [4, 5, 23, 25], [26, 27, 28, 29], [30, 31, 32, 33]];
     let halves: &[f32x4] = bytemuck::cast_slice(&gw_g[..]);
     let nh = N / 4;
     let mut g = [0.0f32; 34];
-    for c in (0..34).step_by(4) {
-        let h = |s: usize, k: usize| if s < 34 { halves[nh * s + k] } else { f32x4::ZERO };
-        let lo = f32x4::transpose([h(c, 0), h(c + 1, 0), h(c + 2, 0), h(c + 3, 0)]);
+    for q in if SHORT { &FEW[..] } else { &ALL[..] } {
+        let h = |i: usize, k: usize| if q[i] < 34 { halves[nh * q[i] + k] } else { f32x4::ZERO };
+        let lo = f32x4::transpose([h(0, 0), h(1, 0), h(2, 0), h(3, 0)]);
         let mut sum = ((lo[0] + lo[1]) + lo[2]) + lo[3];
         if nh == 2 {
-            let hi = f32x4::transpose([h(c, 1), h(c + 1, 1), h(c + 2, 1), h(c + 3, 1)]);
+            let hi = f32x4::transpose([h(0, 1), h(1, 1), h(2, 1), h(3, 1)]);
             sum += ((hi[0] + hi[1]) + hi[2]) + hi[3];
         }
-        for (k, v) in sum.to_array().into_iter().enumerate().take(34 - c) {
-            g[c + k] = v;
+        for (&i, v) in q.iter().zip(sum.to_array()) {
+            if i < 34 {
+                g[i] = v;
+            }
         }
     }
     let (s_z, s_x2, s_dec2) = (g[27], g[26], g[28]);
