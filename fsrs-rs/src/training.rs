@@ -1504,6 +1504,8 @@ struct BatchHost {
     wts: Vec<f32>,
     /// The O(N) expanding-window layout: each column is a whole card, scored at every timestep.
     windowed: bool,
+    /// Windowed path: the real (card) columns; the rest of the bsz columns are empty.
+    cols: usize,
 }
 
 /// Build ONE batch's host arrays from a slice of weighted prefix-items (each item = one column,
@@ -1535,7 +1537,7 @@ fn build_batch_host(chunk: &[WeightedFSRSItem]) -> BatchHost {
         lbl[c] = if current.rating == 1 { 0.0 } else { 1.0 };
         wts[c] = wi.weight;
     }
-    BatchHost { seq, bsz, real_batch_size: real_bsz, th, rh, dts, lbl, wts, windowed: false }
+    BatchHost { seq, bsz, real_batch_size: real_bsz, th, rh, dts, lbl, wts, windowed: false, cols: bsz }
 }
 
 /// Hashes an i64 card id with one multiply (std's SipHash is DoS-hardened and ~5x slower here).
@@ -1687,6 +1689,7 @@ impl CardedPlan {
         }
         BatchHost {
             seq, bsz, real_batch_size: predictions, th, rh, dts: Vec::new(), lbl, wts, windowed: true,
+            cols: batch.len(),
         }
     }
 }
@@ -1737,6 +1740,9 @@ struct GradShared<'a> {
 
 const JOB_STOP: u64 = u64::MAX;
 
+/// A thread's reusable per-step cache slots for the 8-lane and the 4-lane kernels.
+type Caches = (Vec<crate::analytic::Step8>, Vec<crate::analytic::k4::Step8>);
+
 /// Drops the prefix-items in blocks: first one independent load from each item's review buffer
 /// (the loads overlap), then the frees, which find the allocation's heap entry in cache. Freeing
 /// straight through waits on one cache miss per item (~100 ns each on a large collection).
@@ -1752,7 +1758,7 @@ fn free_items(mut items: Vec<FSRSItem>) {
 
 impl GradShared<'_> {
     /// Claim and compute groups of job `seq` until none is left (or the job changed).
-    fn work(&self, seq: u32, w: &[f32], wc: &crate::analytic::WConsts, caches: &mut Vec<crate::analytic::Step8>) {
+    fn work(&self, seq: u32, w: &[f32], wc: &crate::analytic::WConsts, caches: &mut Caches) {
         let hb = self.host[self.batch.load(Ordering::Relaxed)].get().expect("published batch");
         let n = hb.bsz / 8;
         loop {
@@ -1766,9 +1772,17 @@ impl GradShared<'_> {
             }
             // Longest groups first (cards are length-sorted within a batch): better balance.
             let g = n - 1 - k;
-            let gg = crate::analytic::card_group_grad(
-                w, wc, &hb.th, &hb.rh, hb.seq, hb.bsz, &hb.lbl, &hb.wts, g, caches,
-            );
+            // A last group of at most 4 cards runs on 4 lanes: the same per-lane arithmetic, and the
+            // 4 empty lanes' gradient is exactly zero.
+            let gg = if g == n - 1 && hb.cols % 8 != 0 && hb.cols % 8 <= 4 {
+                crate::analytic::k4::card_group_grad(
+                    w, wc, &hb.th, &hb.rh, hb.seq, hb.bsz, &hb.lbl, &hb.wts, g, &mut caches.1,
+                )
+            } else {
+                crate::analytic::card_group_grad(
+                    w, wc, &hb.th, &hb.rh, hb.seq, hb.bsz, &hb.lbl, &hb.wts, g, &mut caches.0,
+                )
+            };
             for (o, x) in self.out[g].iter().zip(gg) {
                 o.store(x.to_bits(), Ordering::Relaxed);
             }
@@ -1785,7 +1799,7 @@ impl GradShared<'_> {
         }
         drop((plan, card_ids));
         free_items(items);
-        let mut caches = Vec::new();
+        let mut caches = (Vec::new(), Vec::new());
         let mut seen = 0u32;
         loop {
             let v = self.job.load(Ordering::Acquire);
@@ -1900,7 +1914,7 @@ fn train<B: AutodiffBackend>(
         done: AtomicUsize::new(0),
         out: (0..max_bsz / 8).map(|_| std::array::from_fn(|_| AtomicU32::new(0))).collect(),
     };
-    let mut caches = Vec::new();
+    let mut caches = (Vec::new(), Vec::new());
     let mut seq = 0u32;
     std::thread::scope(|scope| {
     match batches {
