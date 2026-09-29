@@ -23,7 +23,6 @@ use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -1550,24 +1549,6 @@ fn build_batch_host(chunk: &[WeightedFSRSItem]) -> BatchHost {
     BatchHost { seq, bsz, real_batch_size: real_bsz, th, rh, dts, lbl, wts, windowed: false, cols: bsz }
 }
 
-/// Hashes an i64 card id with one multiply (std's SipHash is DoS-hardened and ~5x slower here).
-#[derive(Default)]
-struct CardIdHasher(u64);
-
-impl std::hash::Hasher for CardIdHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 = (self.0.rotate_left(8) ^ b as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        }
-    }
-    fn write_i64(&mut self, i: i64) {
-        self.0 = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    }
-}
-
 /// Windowed path (card ids present): the batch PLAN built straight from the prefix-items. Each card
 /// becomes ONE column holding its FULL review sequence, taken from its longest surviving prefix
 /// (every shorter prefix is a head of it). A surviving prefix of length L (<= max_seq_len) predicts
@@ -1590,6 +1571,21 @@ struct CardedPlan {
     n_preds: usize,
 }
 
+/// The cards' `key`s ordered by full length (`at`: each length's first position), each length's
+/// keys sorted.
+fn by_length<K: Ord + Default + Clone>(cards: &[PlanCard], at: &[usize], key: impl Fn(usize) -> K) -> Vec<K> {
+    let mut keys = vec![K::default(); cards.len()];
+    let mut fill = at.to_vec();
+    for (ci, card) in cards.iter().enumerate() {
+        keys[fill[card.full_len as usize]] = key(ci);
+        fill[card.full_len as usize] += 1;
+    }
+    for l in at.windows(2) {
+        keys[l[0]..l[1]].sort_unstable();
+    }
+    keys
+}
+
 /// 12 bytes, so the per-item updates of `new` stay in cache (the id is card_ids[longest]).
 struct PlanCard {
     full_len: u32,
@@ -1602,11 +1598,15 @@ impl CardedPlan {
         // One pass in input order over the item headers only (a prefix's label is the rating of
         // review t of its card's longest prefix, and its weight depends only on its index, so both
         // are read at layout time — no per-item heap access here).
-        // Each card has one prefix of length 2 (its first prediction): their count sizes the map
-        // and the card list, so neither grows (a map rehash moves every entry).
+        // Each card has one prefix of length 2 (its first prediction): their count sizes the card
+        // index and the card list, so neither grows.
         let n_cards = items.iter().filter(|item| item.reviews.len() == 2).count();
-        let mut card_index: HashMap<i64, usize, BuildHasherDefault<CardIdHasher>> =
-            HashMap::with_capacity_and_hasher(n_cards, BuildHasherDefault::default());
+        // The card index: open addressing with linear probing on (id, card) slots (card u32::MAX =
+        // empty), at most half full (doubled if more cards arrive than counted); one multiply
+        // hashes an id.
+        let mut bits = usize::BITS - (2 * n_cards).max(8).leading_zeros();
+        let mut slots = vec![(0i64, u32::MAX); 1 << bits];
+        let home = |id: i64, bits: u32| ((id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - bits)) as usize;
         let mut cards: Vec<PlanCard> = Vec::with_capacity(n_cards);
         // Each item's card (u32::MAX = skipped): 4 bytes per item, so the plan touches fewer fresh
         // pages; the grouping below reads t from the item again (in order).
@@ -1618,10 +1618,29 @@ impl CardedPlan {
                 item_card.push(u32::MAX);
                 continue;
             }
-            let ci = *card_index.entry(id).or_insert_with(|| {
+            let mut h = home(id, bits);
+            while slots[h].1 != u32::MAX && slots[h].0 != id {
+                h = (h + 1) & (slots.len() - 1);
+            }
+            let ci = if slots[h].1 != u32::MAX {
+                slots[h].1 as usize
+            } else {
+                slots[h] = (id, cards.len() as u32);
                 cards.push(PlanCard { full_len: 0, longest: 0, n_preds: 0 });
+                if cards.len() * 2 > slots.len() {
+                    bits += 1;
+                    for slot in std::mem::replace(&mut slots, vec![(0, u32::MAX); 1 << bits]) {
+                        let mut h = home(slot.0, bits);
+                        while slot.1 != u32::MAX && slots[h].1 != u32::MAX {
+                            h = (h + 1) & (slots.len() - 1);
+                        }
+                        if slot.1 != u32::MAX {
+                            slots[h] = slot;
+                        }
+                    }
+                }
                 cards.len() - 1
-            });
+            };
             let card = &mut cards[ci];
             // >= keeps the LAST longest prefix (max_by_key's tie rule).
             if len as u32 >= card.full_len {
@@ -1646,7 +1665,9 @@ impl CardedPlan {
             }
         }
         // Order the cards by (full length, card id), a total order (a card's id is unique): a
-        // counting sort by full length (<= max_seq_len), then each length's cards by id.
+        // counting sort by full length (<= max_seq_len), then each length's cards by id. The id
+        // sort runs on one u64 per card, (id - min id) << bits | card index, when the id span fits
+        // (card ids are millisecond timestamps, so it does), else on (id, index) pairs.
         let mut at = vec![0usize; max_seq_len + 2];
         for card in &cards {
             at[card.full_len as usize + 1] += 1;
@@ -1654,16 +1675,16 @@ impl CardedPlan {
         for l in 1..at.len() {
             at[l] += at[l - 1];
         }
-        let mut keys = vec![(0i64, 0u32); cards.len()];
-        let mut fill = at.clone();
-        for (ci, card) in cards.iter().enumerate() {
-            keys[fill[card.full_len as usize]] = (card_ids[card.longest as usize], ci as u32);
-            fill[card.full_len as usize] += 1;
-        }
-        for l in at.windows(2) {
-            keys[l[0]..l[1]].sort_unstable_by_key(|k| k.0);
-        }
-        let order: Vec<usize> = keys.iter().map(|k| k.1 as usize).collect();
+        let id = |ci: usize| card_ids[cards[ci].longest as usize];
+        let min_id = (0..cards.len()).map(id).min().unwrap_or(0);
+        let span = (0..cards.len()).map(|ci| id(ci).abs_diff(min_id)).max().unwrap_or(0);
+        let bits = usize::BITS - cards.len().leading_zeros();
+        let order: Vec<usize> = if span >> (64 - bits) == 0 {
+            let keys = by_length(&cards, &at, |ci| id(ci).abs_diff(min_id) << bits | ci as u64);
+            keys.iter().map(|k| (k & ((1 << bits) - 1)) as usize).collect()
+        } else {
+            by_length(&cards, &at, |ci| (id(ci), ci)).iter().map(|k| k.1).collect()
+        };
         let mut bounds = Vec::new();
         let (mut first, mut current_preds) = (0, 0);
         for (k, &ci) in order.iter().enumerate() {
