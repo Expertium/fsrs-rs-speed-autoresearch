@@ -171,6 +171,18 @@ pub(super) fn curve8_fwd_into<const FAST: bool>(
     let a = t / sf;
     c.a = a;
     let bv = t / s;
+    // iter-165: decay2 no longer d-modulated (m2 = w24 plain); ex34 = exp((d-5)*(d_decay-0.3))
+    // is now the TIME-SCALE inside b2.
+    let ex34 = exp2_8_in_range::<FAST>((d - k(5.0)) * k(wc.w32m_l));
+    // decay2 / p28 = base2[w26]^inv2 / factor2 are weight-only: hoisted into wc.
+    let q2 = bv * F::splat(wc.factor2) * ex34;
+    c.q2 = q2;
+    let b2 = q2 + k(1.0);
+    c.b2 = b2;
+    let ln_b2 = log2_8(b2);
+    c.ln_b2 = ln_b2;
+    let r2 = exp2_8_in_range::<FAST>(F::splat(wc.decay2) * ln_b2);
+    c.r2 = r2;
     // 34-param remap + all-positive offsets: p35=s_short^(s_decay1[w33]-0.3), m1=decay1[w23]*p35,
     // ex34=exp((d-5)*(d_decay[w32]-0.3)), m2=decay2[w24]*ex34, p28=base2[w26]^inv2,
     // p31=s_short^-s_weight_power1[w29], weight1=base_weight1[w27]*p31. ln_w27=ln(base1=w25),
@@ -194,18 +206,6 @@ pub(super) fn curve8_fwd_into<const FAST: bool>(
     c.ln_b1 = ln_b1;
     let r1 = exp2_8_in_range::<FAST>(decay1 * ln_b1);
     c.r1 = r1;
-    // iter-165: decay2 no longer d-modulated (m2 = w24 plain); ex34 = exp((d-5)*(d_decay-0.3))
-    // is now the TIME-SCALE inside b2.
-    let ex34 = exp2_8_in_range::<FAST>((d - k(5.0)) * k(wc.w32m_l));
-    // decay2 / p28 = base2[w26]^inv2 / factor2 are weight-only: hoisted into wc.
-    let q2 = bv * F::splat(wc.factor2) * ex34;
-    c.q2 = q2;
-    let b2 = q2 + k(1.0);
-    c.b2 = b2;
-    let ln_b2 = log2_8(b2);
-    c.ln_b2 = ln_b2;
-    let r2 = exp2_8_in_range::<FAST>(F::splat(wc.decay2) * ln_b2);
-    c.r2 = r2;
     // ret = (weight1*r1 + weight2*r2) / (weight1 + weight2), weight1 = base_weight1[w27] *
     // sf^-s_weight_power1[w29], weight2 = base_weight2[w28] * s^s_weight_power2[w30] *
     // exp((d_weight[w31]-0.5)(d-5)). Written as r1*(1-sig) + r2*sig with sig = sigmoid(z) and
@@ -422,25 +422,25 @@ pub(super) fn stab8_bwd(
     // sinc = aa*bb*cc*(expr-1)*hard*easy + 1
     let em1 = c.em1;
     let g_prod = g_sinc;
-    let base = c.base;
+    // (Ordered so each adjoint is used up soon after it is formed; see curve8_bwd_acc.)
+    let g_he = g_prod * he;
+    // expr = exp((1-r)*w[start+2])
+    let g_em1 = g_he * c.abc;
+    let mut g_r = g_em1 * c.expr * k(-w[start + 2]);
+    gw[start + 2] += g_em1 * c.expr * (one - r);
+    let g_bb = g_he * (aa * c.cc * em1);
+    let g_last_d = g_bb * (z - one); // bb = 11 - last_d (the ONLY D-dependence of stab now)
     // d(prod)/d(hard_penalty) on rating-2 lanes and d(prod)/d(easy_bonus) on rating-4 lanes are
     // both `base` (the other factor is exactly 1 there).
-    let g_base = g_prod * base;
+    let g_base = g_prod * c.base;
+    gw[start + 6] += rating.cmp_eq(k(2.0)).blend(g_base, z); // hard_penalty
+    gw[start + 7] += rating.cmp_eq(k(4.0)).blend(g_base, z); // easy_bonus
     // prod = base * he is a product, so the adjoint of ln(aa) and of ln(cc) are both g_prod * prod.
     let p_ln = g_base * he;
     gw[start] += p_ln; // aa = exp(w[start]-1.5)
-    let g_he = g_prod * he;
-    let g_bb = g_he * (aa * c.cc * em1);
-    let g_em1 = g_he * c.abc;
-    gw[start + 6] += rating.cmp_eq(k(2.0)).blend(g_base, z); // hard_penalty
-    gw[start + 7] += rating.cmp_eq(k(4.0)).blend(g_base, z); // easy_bonus
-    let g_last_d = g_bb * (z - one); // bb = 11 - last_d (the ONLY D-dependence of stab now)
     // cc = last_s^-w[start+1] = exp(-w[start+1] * ln_ls)
     g_last_s += p_ln * k(-w[start + 1]) / last_s;
     gw[start + 1] -= p_ln * ln_ls;
-    // expr = exp((1-r)*w[start+2])
-    let mut g_r = g_em1 * c.expr * k(-w[start + 2]);
-    gw[start + 2] += g_em1 * c.expr * (one - r);
     if !c.full {
         return (g_last_s, g_last_d, g_r);
     }
