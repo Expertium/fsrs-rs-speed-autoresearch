@@ -61,6 +61,7 @@ Accept metric: **median per-user speed_ratio ≥ 1.05** (constraint 12) AND **sp
 | 54 | 6 | 6 | 1.024 | 11364 | 11438 | 1.006 | 1.016 | ✓ | rejected | correctly rounded f64 recency power, main lays out two batches, short-group finish |
 | 55 | 6 | 6 | 1.043 | 11364 | 11452 | 1.008 | 1.020 | ✓ | rejected | iter54 stack plus open-addressing card index, u64 length-bucket sort, last curve in loop |
 | 56 | 6 | 6 | 1.054 | 11364 | 11456 | 1.008 | 1.020 | ✓ | accepted | iter55 stack plus plan step stored in first pass, labels from signed-weight sign bits |
+| 57 | 6 | 6 | 1.032 | 11456 | 11441 | 0.999 | 0.997 | ✓ | rejected | plan per-card chains, helper spawned first, backward-only forward values cached |
 
 **Cumulative speed_ratio (product of accepted): ×394.117** — upward-biased (winner's curse); anchor periodically vs iter-0 baseline.
 

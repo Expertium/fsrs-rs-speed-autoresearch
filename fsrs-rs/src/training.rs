@@ -984,7 +984,7 @@ pub(crate) fn recency_weighted_fsrs_items(items: Vec<FSRSItem>) -> Vec<WeightedF
 /// production (neither var set) is bit-for-bit identical. Used ONLY by the windowed
 /// compute_parameters training path — the frozen evaluate() keeps calling the plain version, so
 /// the scorer is untouched (constraint 11). Returns weight(idx, n) for item idx of n.
-fn recency_weight_tuned() -> impl Fn(usize, f32) -> f32 {
+fn recency_weight_tuned() -> impl Fn(usize, f32) -> f32 + Copy {
     let c0_env = std::env::var("FSRS_RECENCY_C0")
         .ok()
         .and_then(|s| s.trim().parse::<f32>().ok());
@@ -1561,9 +1561,9 @@ fn build_batch_host(chunk: &[WeightedFSRSItem]) -> BatchHost {
 /// normalize_training_set does), so train() can lay out batches on its second thread.
 struct CardedPlan {
     cards: Vec<PlanCard>,
-    /// Each card's predictions (t, item index), contiguous per card and in input order.
-    start: Vec<usize>,
-    by_card: Vec<(u32, u32)>,
+    /// Each item's step t | the index of its card's previous item << 32 (u32::MAX = none): each
+    /// card's predictions form a chain from PlanCard::last back to its first item.
+    link: Vec<u64>,
     order: Vec<usize>,
     /// Each batch = order[first..end].
     bounds: Vec<(usize, usize)>,
@@ -1586,11 +1586,14 @@ fn by_length<K: Ord + Default + Clone>(cards: &[PlanCard], at: &[usize], key: im
     keys
 }
 
-/// 12 bytes, so the per-item updates of `new` stay in cache (the id is card_ids[longest]).
+/// 24 bytes, so the per-item updates of `new` stay in cache.
 struct PlanCard {
+    id: i64,
     full_len: u32,
     longest: u32,
     n_preds: u32,
+    /// The card's last item (the head of its chain in CardedPlan::link).
+    last: u32,
 }
 
 impl CardedPlan {
@@ -1601,42 +1604,41 @@ impl CardedPlan {
         // Each card has one prefix of length 2 (its first prediction): their count sizes the card
         // index and the card list, so neither grows.
         let n_cards = items.iter().filter(|item| item.reviews.len() == 2).count();
-        // The card index: open addressing with linear probing on (id, card) slots (card u32::MAX =
-        // empty), at most half full (doubled if more cards arrive than counted); one multiply
-        // hashes an id.
+        // The card index: open addressing with linear probing on card slots (u32::MAX = empty; a
+        // slot's id is its card's), at most half full (doubled if more cards arrive than counted);
+        // one multiply hashes an id.
         let mut bits = usize::BITS - (2 * n_cards).max(8).leading_zeros();
-        let mut slots = vec![(0i64, u32::MAX); 1 << bits];
+        let mut slots = vec![u32::MAX; 1 << bits];
         let home = |id: i64, bits: u32| ((id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - bits)) as usize;
         let mut cards: Vec<PlanCard> = Vec::with_capacity(n_cards);
-        // Each item's card << 32 | its step t (u64::MAX = skipped), so the grouping below does not
-        // read the items again.
-        let mut item_card: Vec<u64> = Vec::with_capacity(items.len());
+        let mut link: Vec<u64> = Vec::with_capacity(items.len());
+        let (mut min_id, mut max_id) = (i64::MAX, i64::MIN);
         let mut n_preds = 0;
         for (idx, (item, &id)) in items.iter().zip(card_ids).enumerate() {
             let len = item.reviews.len();
             if len > max_seq_len {
-                item_card.push(u64::MAX);
+                link.push(u64::MAX);
                 continue;
             }
             let mut h = home(id, bits);
-            while slots[h].1 != u32::MAX && slots[h].0 != id {
+            while slots[h] != u32::MAX && cards[slots[h] as usize].id != id {
                 h = (h + 1) & (slots.len() - 1);
             }
-            let ci = if slots[h].1 != u32::MAX {
-                slots[h].1 as usize
+            let ci = if slots[h] != u32::MAX {
+                slots[h] as usize
             } else {
-                slots[h] = (id, cards.len() as u32);
-                cards.push(PlanCard { full_len: 0, longest: 0, n_preds: 0 });
+                slots[h] = cards.len() as u32;
+                cards.push(PlanCard { id, full_len: 0, longest: 0, n_preds: 0, last: u32::MAX });
+                (min_id, max_id) = (min_id.min(id), max_id.max(id));
                 if cards.len() * 2 > slots.len() {
                     bits += 1;
-                    for slot in std::mem::replace(&mut slots, vec![(0, u32::MAX); 1 << bits]) {
-                        let mut h = home(slot.0, bits);
-                        while slot.1 != u32::MAX && slots[h].1 != u32::MAX {
+                    slots = vec![u32::MAX; 1 << bits];
+                    for (ci, card) in cards.iter().enumerate() {
+                        let mut h = home(card.id, bits);
+                        while slots[h] != u32::MAX {
                             h = (h + 1) & (slots.len() - 1);
                         }
-                        if slot.1 != u32::MAX {
-                            slots[h] = slot;
-                        }
+                        slots[h] = ci as u32;
                     }
                 }
                 cards.len() - 1
@@ -1649,21 +1651,8 @@ impl CardedPlan {
             }
             card.n_preds += 1;
             n_preds += 1;
-            item_card.push((ci as u64) << 32 | (len - 1) as u64);
-        }
-        // Each card's predictions, contiguous and in input order (a counting sort).
-        let mut start = vec![0usize; cards.len() + 1];
-        for (ci, card) in cards.iter().enumerate() {
-            start[ci + 1] = start[ci] + card.n_preds as usize;
-        }
-        let mut fill = start.clone();
-        let mut by_card = vec![(0u32, 0u32); n_preds];
-        for (idx, &ct) in item_card.iter().enumerate() {
-            if ct != u64::MAX {
-                let ci = (ct >> 32) as usize;
-                by_card[fill[ci]] = (ct as u32, idx as u32);
-                fill[ci] += 1;
-            }
+            link.push((card.last as u64) << 32 | (len - 1) as u64);
+            card.last = idx as u32;
         }
         // Order the cards by (full length, card id), a total order (a card's id is unique): a
         // counting sort by full length (<= max_seq_len), then each length's cards by id. The id
@@ -1676,9 +1665,8 @@ impl CardedPlan {
         for l in 1..at.len() {
             at[l] += at[l - 1];
         }
-        let id = |ci: usize| card_ids[cards[ci].longest as usize];
-        let min_id = (0..cards.len()).map(id).min().unwrap_or(0);
-        let span = (0..cards.len()).map(|ci| id(ci).abs_diff(min_id)).max().unwrap_or(0);
+        let id = |ci: usize| cards[ci].id;
+        let span = max_id.abs_diff(min_id); // (no cards: then the order is empty either way)
         let bits = usize::BITS - cards.len().leading_zeros();
         let order: Vec<usize> = if span >> (64 - bits) == 0 {
             let keys = by_length(&cards, &at, |ci| id(ci).abs_diff(min_id) << bits | ci as u64);
@@ -1699,7 +1687,7 @@ impl CardedPlan {
         if first < order.len() {
             bounds.push((first, order.len()));
         }
-        Self { cards, start, by_card, order, bounds, n_items: items.len(), n_preds }
+        Self { cards, link, order, bounds, n_items: items.len(), n_preds }
     }
 
     /// Padded column count of batch `b` (a multiple of 8: the SIMD kernels' 8-card groups).
@@ -1729,10 +1717,18 @@ impl CardedPlan {
                 th[t * bsz + c] = r.delta_t.max(0.0);
                 rh[t * bsz + c] = r.rating as f32;
             }
-            for &(t, idx) in &self.by_card[self.start[ci]..self.start[ci + 1]] {
-                let t = t as usize;
-                let label = if reviews[t].rating == 1 { 0.0 } else { 1.0 };
-                wts[t * bsz + c] = crate::analytic::signed_weight(weight(idx as usize, length), label);
+            // The card's chain, last item first. Two items of one card with the same step (not in
+            // real data) share one slot: the later item's weight stays, as in input order.
+            let mut idx = self.cards[ci].last;
+            while idx != u32::MAX {
+                let e = self.link[idx as usize];
+                let t = e as u32 as usize;
+                let slot = &mut wts[t * bsz + c];
+                if slot.to_bits() == (-0.0f32).to_bits() {
+                    let label = if reviews[t].rating == 1 { 0.0 } else { 1.0 };
+                    *slot = crate::analytic::signed_weight(weight(idx as usize, length), label);
+                }
+                idx = (e >> 32) as u32;
             }
             predictions += self.cards[ci].n_preds as usize;
         }
@@ -1794,6 +1790,9 @@ struct GradShared<'a> {
 
 const JOB_STOP: u64 = u64::MAX;
 
+/// The windowed plan, the prefix-items and their card ids, handed from the main thread to the helper.
+type Planned = Mutex<Option<(CardedPlan, Vec<FSRSItem>, Vec<i64>)>>;
+
 /// A thread's reusable per-step cache slots for the 8-lane and the 4-lane kernels.
 type Caches = (Vec<crate::analytic::Step8>, Vec<crate::analytic::k4::Step8>);
 
@@ -1851,11 +1850,10 @@ impl GradShared<'_> {
     }
 
     /// The second thread: lay out the windowed batches in the order training first uses them, free
-    /// the prefix-items, then help with every published job.
-    fn helper(
-        &self, plan: CardedPlan, items: Vec<FSRSItem>, card_ids: Vec<i64>, first_order: &[usize],
-        weight: impl Fn(usize, f32) -> f32,
-    ) {
+    /// the prefix-items, then help with every published job. It takes the plan and the items once
+    /// the main thread has laid out its lead batches (it holds the lock until then).
+    fn helper(&self, planned: &Planned, first_order: &[usize], weight: impl Fn(usize, f32) -> f32) {
+        let (plan, items, card_ids) = planned.lock().unwrap().take().expect("the plan");
         for &b in first_order {
             let _ = self.host[b].set(plan.layout(&items, b, &weight));
         }
@@ -1982,25 +1980,31 @@ fn train<B: AutodiffBackend>(
         ready: (0..max_bsz / 8).map(|_| AtomicU32::new(0)).collect(),
         trash: Mutex::new(Vec::new()),
     };
-    let mut caches = (Vec::new(), Vec::new());
-    let mut seq = 0u32;
-    std::thread::scope(|scope| {
-    match batches {
+    let planned: Option<Planned> = match batches {
         TrainBatches::Built(host) => {
             for (slot, hb) in train_host.iter().zip(host) {
                 let _ = slot.set(hb);
             }
+            None
         }
-        TrainBatches::Planned(plan, items, card_ids) => {
-            // The first batch is laid out here: starting the helper thread takes ~0.1 ms.
-            let weight = recency_weight_tuned();
-            let lead = first_order.len().min(2);
-            for &b in &first_order[..lead] {
-                let _ = train_host[b].set(plan.layout(&items, b, &weight));
-            }
-            let (shared, rest) = (&shared, &first_order[lead..]);
-            scope.spawn(move || shared.helper(plan, items, card_ids, rest, weight));
+        TrainBatches::Planned(plan, items, card_ids) => Some(Mutex::new(Some((plan, items, card_ids)))),
+    };
+    let mut caches = (Vec::new(), Vec::new());
+    let mut seq = 0u32;
+    std::thread::scope(|scope| {
+    if let Some(planned) = &planned {
+        // The first batches are laid out here, after the spawn: the helper thread takes ~0.1 ms to
+        // start.
+        let weight = recency_weight_tuned();
+        let lead = first_order.len().min(2);
+        let guard = planned.lock().unwrap();
+        let (shared, rest) = (&shared, &first_order[lead..]);
+        scope.spawn(move || shared.helper(planned, rest, weight));
+        let (plan, items, _) = guard.as_ref().expect("the plan");
+        for &b in &first_order[..lead] {
+            let _ = train_host[b].set(plan.layout(items, b, &weight));
         }
+        drop(guard);
     }
     for epoch in 1..=config.num_epochs {
         // Replicate the dataloader's per-epoch shuffle (one shuffle of [0, n_batches) per epoch).
@@ -2020,14 +2024,22 @@ fn train<B: AutodiffBackend>(
             let w_vec = &w_host;
             let _tb = tick();
             if hb.windowed {
-                // Publish the job first: the helper starts on its groups while this thread computes
-                // the penalty terms and the learning rate, which the kernel does not need.
+                // Publish the job first: the helper starts on its groups at once. This thread computes
+                // the learning rate and the penalty terms (which the kernel does not need) after its
+                // own groups, while the helper finishes its last one.
                 for (a, &x) in shared.w.iter().zip(w_vec) {
                     a.store(x.to_bits(), Ordering::Relaxed);
                 }
                 shared.batch.store(bi, Ordering::Relaxed);
                 seq += 1;
                 shared.job.store((seq as u64) << 32, Ordering::Release);
+            }
+            let mut total_grad = [0.0f64; 34];
+            if hb.windowed {
+                // O(N) expanding-window grad: one pass per card, a loss at every timestep, with the
+                // groups split over the two threads (see GradShared).
+                let wc = crate::analytic::wconsts(w_vec);
+                shared.work(seq, w_vec, &wc, &mut caches);
             }
             t_bwd += secs(_tb);
             let lr = LrScheduler::step(&mut lr_scheduler);
@@ -2054,12 +2066,7 @@ fn train<B: AutodiffBackend>(
             // Hand-written analytic BCE gradient (replaces the autodiff forward+backward),
             // plus the manual L2/schedule penalty gradient.
             let _tb = tick();
-            let mut total_grad = [0.0f64; 34];
             if hb.windowed {
-                // O(N) expanding-window grad: one pass per card, a loss at every timestep, with the
-                // groups split over the two threads (see GradShared).
-                let wc = crate::analytic::wconsts(w_vec);
-                shared.work(seq, w_vec, &wc, &mut caches);
                 // The groups in group order, each as soon as it is ready (so the adds overlap the
                 // helper's last group).
                 for (group, ready) in shared.out.iter().zip(&shared.ready).take(hb.bsz / 8) {
